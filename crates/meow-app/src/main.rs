@@ -677,40 +677,10 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::bind_socket_addr;
     #[cfg(target_os = "windows")]
     use super::{run_application, Args, LogTarget, ShutdownSignal};
     #[cfg(target_os = "windows")]
     use clap::Parser;
-
-    #[test]
-    fn ipv4_bind_address() {
-        let a = bind_socket_addr("0.0.0.0", 7890).unwrap();
-        assert_eq!(a.to_string(), "0.0.0.0:7890");
-        assert!(a.is_ipv4());
-    }
-
-    #[test]
-    fn ipv6_unspecified_bind_address_is_dual_stack() {
-        // Regression: format!("{}:{}", "::", port) yields the unparseable
-        // ":::7890". SocketAddr::new must bracket it correctly so that
-        // `bind-address: '::'` actually binds (and on Linux accepts both
-        // IPv4 and IPv6 LAN clients).
-        let a = bind_socket_addr("::", 7890).unwrap();
-        assert_eq!(a.to_string(), "[::]:7890");
-        assert!(a.is_ipv6());
-    }
-
-    #[test]
-    fn specific_ipv6_bind_address() {
-        let a = bind_socket_addr("2408:820c:8f4b:9b41::1001", 9090).unwrap();
-        assert_eq!(a.to_string(), "[2408:820c:8f4b:9b41::1001]:9090");
-    }
-
-    #[test]
-    fn invalid_bind_address_errors() {
-        assert!(bind_socket_addr("not-an-ip", 80).is_err());
-    }
 
     #[cfg(target_os = "windows")]
     #[test]

@@ -490,3 +490,41 @@ pub async fn run(
 
     Ok(())
 }
+
+// hangil 포크: `bind_socket_addr` 이 `main.rs` 에서 여기로 옮겨 오면서(P-1)
+// 그 테스트는 `main.rs` 에 남아 `use super::bind_socket_addr` 로 사라진 이름을
+// 가리키게 됐다. 바이너리 테스트 타깃이 컴파일되지 않는다. 테스트를 함수 옆으로
+// 옮긴다 — 함수를 `pub` 으로 넓히는 것보다 낫다.
+#[cfg(test)]
+mod bind_addr_tests {
+    use super::bind_socket_addr;
+
+    #[test]
+    fn ipv4_bind_address() {
+        let a = bind_socket_addr("0.0.0.0", 7890).unwrap();
+        assert_eq!(a.to_string(), "0.0.0.0:7890");
+        assert!(a.is_ipv4());
+    }
+
+    #[test]
+    fn ipv6_unspecified_bind_address_is_dual_stack() {
+        // Regression: format!("{}:{}", "::", port) yields the unparseable
+        // ":::7890". SocketAddr::new must bracket it correctly so that
+        // `bind-address: '::'` actually binds (and on Linux accepts both
+        // IPv4 and IPv6 LAN clients).
+        let a = bind_socket_addr("::", 7890).unwrap();
+        assert_eq!(a.to_string(), "[::]:7890");
+        assert!(a.is_ipv6());
+    }
+
+    #[test]
+    fn specific_ipv6_bind_address() {
+        let a = bind_socket_addr("2408:820c:8f4b:9b41::1001", 9090).unwrap();
+        assert_eq!(a.to_string(), "[2408:820c:8f4b:9b41::1001]:9090");
+    }
+
+    #[test]
+    fn invalid_bind_address_errors() {
+        assert!(bind_socket_addr("not-an-ip", 80).is_err());
+    }
+}
