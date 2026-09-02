@@ -8,6 +8,15 @@ use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::sync::Arc;
 
+/// Matches the health-check probe timeout (`meow-app`'s `PROBE_TIMEOUT`), so a
+/// bootstrap race gives up on the same schedule a probe would.
+const BOOTSTRAP_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound on how many members a single cold-boot race opens at once. A
+/// group with dozens of members should not answer its first request with
+/// dozens of simultaneous connections.
+const MAX_BOOTSTRAP_RACE: usize = 4;
+
 pub struct UrlTestGroup {
     name: SmolStr,
     static_proxies: Vec<Arc<dyn Proxy>>,
@@ -127,6 +136,11 @@ impl UrlTestGroup {
         let mut current_delay: u16 = u16::MAX;
         let mut current_alive = false;
         let mut first_any: Option<Arc<dyn Proxy>> = None;
+        // The first member that is at least *marked* alive. `first_any` says
+        // nothing about liveness — it is whatever the config listed first —
+        // so falling back to it hands the dial to a member already known to
+        // be down while a live one sits next to it.
+        let mut first_alive: Option<Arc<dyn Proxy>> = None;
 
         // Inline visit logic to avoid an `FnMut` closure that would conflict
         // with the multiple mutable borrows below.
@@ -137,6 +151,9 @@ impl UrlTestGroup {
                     first_any = Some(Arc::clone(p));
                 }
                 if p.alive() {
+                    if first_alive.is_none() {
+                        first_alive = Some(Arc::clone(p));
+                    }
                     let d = p.last_delay();
                     if let Some(ref n) = current_name {
                         if p.name() == n.as_str() {
@@ -169,11 +186,102 @@ impl UrlTestGroup {
                 return Some(Arc::clone(bp));
             }
         } else if !current_alive {
-            let fb = first_any.clone();
-            *self.fastest.write() = fb.as_ref().map(|p| SmolStr::from(p.name()));
-            return fb;
+            // Return the fallback but do NOT record it as `fastest`. This is
+            // a guess made with no measurements at all, and writing it makes
+            // it permanent: the guess then reports `current_delay == 0` and
+            // `current_alive == true`, so the promotion test below
+            // (`best + tolerance < current_delay`) can never hold again and a
+            // member that later gets a real measurement is never promoted.
+            // `fastest` is written only where a measurement justifies it.
+            //
+            // Prefer a member that is still alive. Only when nobody is does
+            // the first member win, and then deliberately: surfacing a real
+            // network error beats a "no proxy available" config error.
+            return first_alive.clone().or_else(|| first_any.clone());
         }
-        current_proxy.or(best_proxy).or(first_any)
+        current_proxy.or(best_proxy).or(first_alive).or(first_any)
+    }
+
+    /// Members worth racing while the group has no measurement to rank by.
+    ///
+    /// `Some` only when no member carries a delay (and the user has not
+    /// pinned one, and no incumbent has been promoted). Two situations reach
+    /// that state, and the second is the one that matters in production:
+    ///
+    /// - a genuinely cold boot — nothing probed yet. The health check runs
+    ///   every 300 s by default, so this window is not always small.
+    /// - **every probe failed.** That does not mean every node is unusable:
+    ///   the URL test dials a fixed probe URL (`www.gstatic.com` by default),
+    ///   and where that host is unreachable every member is marked dead while
+    ///   the nodes themselves work fine. Selection then has nothing to go on
+    ///   and hands every dial to whichever member the config listed first.
+    ///
+    /// So liveness is deliberately *not* a filter here. A `false` recorded by
+    /// a probe that could not reach its own target says nothing about whether
+    /// the node can carry traffic; the only way to find out is to try.
+    /// `last_delay() > 0` is the real signal, and the moment any member has
+    /// it this returns `None` and ordinary selection takes over.
+    ///
+    /// The common case costs one lock read: after a race wins, `fastest` is
+    /// set and this returns `None` immediately.
+    fn cold_boot_candidates(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        if self.fixed.read().is_some() || self.fastest.read().is_some() {
+            return None;
+        }
+        let mut out: Vec<Arc<dyn Proxy>> = Vec::new();
+        macro_rules! consider {
+            ($p:expr) => {{
+                let p: &Arc<dyn Proxy> = $p;
+                if p.last_delay() > 0 {
+                    // Somebody has been measured — ordinary selection knows
+                    // more than a race would.
+                    return None;
+                }
+                if out.len() < MAX_BOOTSTRAP_RACE {
+                    out.push(Arc::clone(p));
+                }
+            }};
+        }
+        for p in &self.static_proxies {
+            consider!(p);
+        }
+        for slot in &self.provider_slots {
+            let guard = slot.read();
+            for p in guard.iter() {
+                consider!(p);
+            }
+        }
+        (out.len() > 1).then_some(out)
+    }
+
+    /// Dial every candidate at once and keep the first connection that comes
+    /// up; the rest are dropped, which cancels them.
+    ///
+    /// No user payload rides on the losers. `dial_tcp` only establishes the
+    /// connection to the node — the tunnel writes the request afterwards, on
+    /// the single connection returned here.
+    async fn bootstrap_race(
+        &self,
+        candidates: &[Arc<dyn Proxy>],
+        metadata: &Metadata,
+    ) -> Option<(Arc<dyn Proxy>, Box<dyn ProxyConn>)> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut futs = FuturesUnordered::new();
+        for c in candidates {
+            let c = Arc::clone(c);
+            futs.push(async move {
+                match tokio::time::timeout(BOOTSTRAP_DIAL_TIMEOUT, c.dial_tcp(metadata)).await {
+                    Ok(Ok(conn)) => Some((c, conn)),
+                    _ => None,
+                }
+            });
+        }
+        while let Some(r) = futs.next().await {
+            if let Some(hit) = r {
+                return Some(hit);
+            }
+        }
+        None
     }
 
     /// Read-only lookup of whatever `fastest` currently points at — used by
@@ -255,6 +363,15 @@ impl ProxyAdapter for UrlTestGroup {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        // On a genuinely cold boot there is nothing to rank, so race instead
+        // of trusting the config's ordering. The winner becomes the incumbent
+        // and this path is skipped from the next dial on.
+        if let Some(candidates) = self.cold_boot_candidates() {
+            if let Some((winner, conn)) = self.bootstrap_race(&candidates, metadata).await {
+                *self.fastest.write() = Some(SmolStr::from(winner.name()));
+                return Ok(conn);
+            }
+        }
         let proxy = self
             .pick_for_dial()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
@@ -422,6 +539,113 @@ mod tests {
             "a",
             "graceful degradation: surface a real network error from a, \
              not a 'no proxy' config error"
+        );
+    }
+
+    /// Cold boot has no delay history, so the picker cannot rank anyone and
+    /// falls back to the first member. Latching that guess into `fastest`
+    /// makes it permanent for as long as the guess stays *marked* alive:
+    /// `current_delay` is then 0 and `current_alive` is true, so the
+    /// promotion test `best + tolerance < current_delay` can never hold. A
+    /// member that later reports a real delay is never promoted.
+    ///
+    /// Staying marked alive while being useless is the normal case, not a
+    /// contrived one: nothing but the health check writes liveness, user
+    /// dial failures do not (see `record_delay`'s only callers), and the
+    /// check runs every 300 s by default.
+    #[test]
+    fn a_cold_boot_pick_does_not_latch_the_first_member() {
+        let unprobed = MockProxy::new("unprobed");
+        let live = MockProxy::new("live");
+        let live_ref = Arc::clone(&live);
+        let g = UrlTestGroup::new("ut", vec![unprobed, live], 150);
+
+        // Cold boot: no history, everyone still marked alive.
+        let _ = g.pick_for_dial();
+
+        // A probe lands on `live` only. `unprobed` keeps alive=true and
+        // last_delay=0 — the health check has not reached it yet.
+        live_ref.set_delay(40);
+
+        assert_eq!(
+            pick(&g),
+            "live",
+            "a member with a real measurement lost to a latched guess"
+        );
+    }
+
+    /// A cold-boot dial must reach every candidate, not only the one the
+    /// config listed first. Without the race, a dead first member makes the
+    /// first connection fail outright and the node order in the config
+    /// decides whether the tunnel works at all.
+    ///
+    /// `MockProxy::dial_tcp` always fails, so no winner is possible here —
+    /// what this pins is that both members were *tried*.
+    #[tokio::test]
+    async fn a_cold_boot_dial_reaches_every_candidate() {
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        let g = UrlTestGroup::new("ut", vec![a, b], 150);
+
+        let _ = g.dial_tcp(&Metadata::default()).await;
+
+        assert!(a_ref.dials() >= 1, "첫 멤버를 시도하지 않았다");
+        assert!(b_ref.dials() >= 1, "두 번째 멤버는 아예 시도되지 않았다");
+    }
+
+    /// Once anyone carries a measurement the race stops: ordinary selection
+    /// knows more than a race does, and racing every dial would open a
+    /// connection per member forever.
+    #[tokio::test]
+    async fn the_race_stops_as_soon_as_anyone_has_been_measured() {
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        b_ref.set_delay(30);
+        let g = UrlTestGroup::new("ut", vec![a, b], 150);
+
+        let _ = g.dial_tcp(&Metadata::default()).await;
+
+        assert_eq!(a_ref.dials(), 0, "측정치가 있는데도 레이스를 돌았다");
+        assert_eq!(b_ref.dials(), 1, "가장 빠른 멤버 하나만 걸어야 한다");
+    }
+
+    /// A member already known to be down must not win the fallback just
+    /// because the config listed it first. Found by the interop harness:
+    /// the startup URL test marks the unreachable node dead, which takes it
+    /// out of the cold-boot race — and the fallback then handed every dial
+    /// straight back to it.
+    #[test]
+    fn a_fallback_prefers_a_member_that_is_still_alive() {
+        let dead = MockProxy::new("dead");
+        dead.set_alive(false);
+        let live = MockProxy::new("live"); // alive but never measured
+        let g = UrlTestGroup::new("ut", vec![dead, live], 150);
+        assert_eq!(pick(&g), "live", "이미 죽은 줄 아는 노드로 걸었다");
+    }
+
+    /// Every probe failing does not mean every node is unusable — the probe
+    /// URL itself may be unreachable. With no measurement anywhere, the race
+    /// must still try the members rather than hand every dial to member 0.
+    #[tokio::test]
+    async fn a_group_whose_probes_all_failed_still_races() {
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        // What a failed probe leaves behind: marked dead, no usable delay.
+        a_ref.set_alive(false);
+        b_ref.set_alive(false);
+        let g = UrlTestGroup::new("ut", vec![a, b], 150);
+
+        let _ = g.dial_tcp(&Metadata::default()).await;
+
+        assert!(
+            a_ref.dials() >= 1 && b_ref.dials() >= 1,
+            "죽었다고 표시됐다는 이유로 아무도 시도하지 않았다"
         );
     }
 

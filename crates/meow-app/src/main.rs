@@ -6,8 +6,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use anyhow::Result;
 // hangil 포크: 아래 셋은 lib.rs 로 옮겨 공개시켰다.
-use meow_app::{run, ReadyCallback, ShutdownSignal};
 use clap::{Parser, Subcommand};
+use meow_app::{run, ReadyCallback, ShutdownSignal};
 use meow_config::load_config;
 use tracing::{error, info};
 
@@ -108,13 +108,11 @@ enum LogTarget {
     WindowsService(std::path::PathBuf),
 }
 
-
 struct Logging {
     tx: tokio::sync::broadcast::Sender<meow_api::log_stream::LogMessage>,
     #[cfg(target_os = "windows")]
     _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
-
 
 fn main() -> Result<()> {
     // dhat profiler guard — must be the first local, lives for the duration of main().
@@ -676,8 +674,6 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 #[cfg(test)]
 mod tests {

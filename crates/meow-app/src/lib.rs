@@ -48,7 +48,6 @@ WantedBy=multi-user.target
     )
 }
 
-
 // ── hangil 포크 패치 ────────────────────────────────────────────────────────
 // `run()` 은 `main.rs` 안의 비공개 함수라 임베더가 쓸 수 없었다. 여기로 옮겨
 // `pub` 으로 만든다. `ShutdownSignal` 과 `ReadyCallback` 은 그 시그니처에
@@ -266,10 +265,8 @@ pub async fn run(
         let resolver = Arc::clone(&resolver);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            crate::geodata_fetch::run_on_startup(
-                geodata, tunnel, raw_config, resolver, cache_dir,
-            )
-            .await;
+            crate::geodata_fetch::run_on_startup(geodata, tunnel, raw_config, resolver, cache_dir)
+                .await;
         });
     }
 
