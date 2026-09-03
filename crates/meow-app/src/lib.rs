@@ -72,8 +72,18 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-#[cfg(target_os = "windows")]
-mod windows_service;
+// hangil 포크: P-1 이 `run()` 을 `main.rs` 에서 여기로 옮기면서
+// `#[cfg(target_os = "windows")] mod windows_service;` 선언까지 함께 복사했다.
+// 그 모듈은 **바이너리의 것**이다 — `super::{Args, LogTarget, run_application}`
+// 을 참조하는데 셋 다 `main.rs` 에만 있다. 그래서 Windows 를 타깃하면
+// 라이브러리가 그 파일을 자기 루트에 대고 컴파일하려다 죽는다:
+//   error[E0432]: unresolved imports `super::Args`, `super::LogTarget`
+//   error[E0425]: cannot find function `run_application` in module `super`
+// `main.rs:15` 가 같은 선언을 그대로 갖고 있고 호출부 4곳도 거기 있으므로,
+// 여기서는 지우기만 하면 된다. lib.rs 안에는 참조가 한 곳도 없었다.
+//
+// P-3 과 같은 종류의 잔재다 — P-1 이 옮기면서 남긴 것을, 그 플랫폼을
+// 빌드해 보기 전까지 아무도 볼 수 없었다.
 
 pub enum ShutdownSignal {
     Console,
