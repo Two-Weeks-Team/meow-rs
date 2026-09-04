@@ -1,3 +1,4 @@
+mod bootstrap;
 pub mod dialer_proxy;
 pub mod fallback;
 pub mod load_balance;

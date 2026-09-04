@@ -7,16 +7,8 @@ use meow_common::{
 use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::sync::Arc;
-use tracing::warn;
 
-/// Matches the health-check probe timeout (`meow-app`'s `PROBE_TIMEOUT`), so a
-/// bootstrap race gives up on the same schedule a probe would.
-const BOOTSTRAP_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Upper bound on how many members a single cold-boot race opens at once. A
-/// group with dozens of members should not answer its first request with
-/// dozens of simultaneous connections.
-const MAX_BOOTSTRAP_RACE: usize = 4;
+use super::bootstrap::{bootstrap_race, record_dial, MAX_BOOTSTRAP_RACE};
 
 pub struct UrlTestGroup {
     name: SmolStr,
@@ -255,66 +247,6 @@ impl UrlTestGroup {
         (out.len() > 1).then_some(out)
     }
 
-    /// Dial every candidate at once and keep the first connection that comes
-    /// up; the rest are dropped, which cancels them.
-    ///
-    /// No user payload rides on the losers. `dial_tcp` only establishes the
-    /// connection to the node — the tunnel writes the request afterwards, on
-    /// the single connection returned here.
-    async fn bootstrap_race(
-        &self,
-        candidates: &[Arc<dyn Proxy>],
-        metadata: &Metadata,
-    ) -> Option<(Arc<dyn Proxy>, Box<dyn ProxyConn>)> {
-        use futures::stream::{FuturesUnordered, StreamExt};
-        let mut futs = FuturesUnordered::new();
-        for c in candidates {
-            let c = Arc::clone(c);
-            futs.push(async move {
-                match tokio::time::timeout(BOOTSTRAP_DIAL_TIMEOUT, c.dial_tcp(metadata)).await {
-                    Ok(Ok(conn)) => Some((c, conn)),
-                    _ => None,
-                }
-            });
-        }
-        while let Some(r) = futs.next().await {
-            if let Some(hit) = r {
-                return Some(hit);
-            }
-        }
-        None
-    }
-
-    /// Feed the outcome of a real dial back into the member's health.
-    ///
-    /// This belongs here rather than in the tunnel. The tunnel holds the
-    /// *group*, and a group's own `ProxyHealth` is not what selection reads —
-    /// `UrlTestGroup::alive` delegates to whichever member is current — so
-    /// reporting there would change nothing. Here we know which member was
-    /// actually dialled.
-    ///
-    /// A single failure does not condemn a member; `record_dial_failure`
-    /// counts consecutive failures and only marks it dead at the threshold.
-    fn record_dial<T>(proxy: &Arc<dyn Proxy>, outcome: Result<T>) -> Result<T> {
-        match outcome {
-            Ok(v) => {
-                proxy.health().record_dial_success();
-                Ok(v)
-            }
-            Err(e) => {
-                if proxy.health().record_dial_failure() {
-                    warn!(
-                        "{} marked dead after {} consecutive dial failures; last: {}",
-                        proxy.name(),
-                        meow_common::DIAL_FAILURES_BEFORE_DEAD,
-                        e
-                    );
-                }
-                Err(e)
-            }
-        }
-    }
-
     /// Read-only lookup of whatever `fastest` currently points at — used by
     /// the REST/info methods below.  No Vec allocation; falls back to the
     /// first proxy if `fastest` is unset or names something no longer present.
@@ -398,7 +330,7 @@ impl ProxyAdapter for UrlTestGroup {
         // of trusting the config's ordering. The winner becomes the incumbent
         // and this path is skipped from the next dial on.
         if let Some(candidates) = self.cold_boot_candidates() {
-            if let Some((winner, conn)) = self.bootstrap_race(&candidates, metadata).await {
+            if let Some((winner, conn)) = bootstrap_race(&candidates, metadata).await {
                 *self.fastest.write() = Some(SmolStr::from(winner.name()));
                 winner.health().record_dial_success();
                 return Ok(conn);
@@ -407,14 +339,14 @@ impl ProxyAdapter for UrlTestGroup {
         let proxy = self
             .pick_for_dial()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
-        Self::record_dial(&proxy, proxy.dial_tcp(metadata).await)
+        record_dial(&proxy, proxy.dial_tcp(metadata).await)
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         let proxy = self
             .pick_for_dial()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
-        Self::record_dial(&proxy, proxy.dial_udp(metadata).await)
+        record_dial(&proxy, proxy.dial_udp(metadata).await)
     }
 
     fn unwrap_proxy(&self, _metadata: &Metadata) -> Option<Arc<dyn Proxy>> {

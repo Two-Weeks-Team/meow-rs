@@ -1,3 +1,4 @@
+use super::bootstrap::{bootstrap_race, record_dial, MAX_BOOTSTRAP_RACE};
 use super::selector_store::SelectorStore;
 use async_trait::async_trait;
 use meow_common::{
@@ -123,6 +124,53 @@ impl FallbackGroup {
         fallback
     }
 
+    /// Members worth racing when the group is *blind*: nobody is pinned,
+    /// nobody is marked alive, and nobody carries a measurement.
+    ///
+    /// A fallback group's contract is "the first alive member, in config
+    /// order" — that ordering is a product decision (HY2 ahead of REALITY)
+    /// and this must not second-guess it. So as long as *any* member is alive
+    /// there is nothing to race: `first_alive` already has an answer.
+    ///
+    /// The blind state is different. Every probe failed — which, when the
+    /// probe URL is what is unreachable (China), says nothing about the
+    /// nodes — and `first_alive` degrades to "member 0, whatever its state".
+    /// If member 0 is a black hole the first request hangs on it. The
+    /// `url-test` group solved exactly this with a cold-boot race (hangil
+    /// fork P-2); switching the product to `fallback` silently lost it.
+    /// Racing here restores it without touching the ordering: the winner is
+    /// used for this dial and its success is recorded, so it is *alive*
+    /// from the next dial on and ordinary selection takes over.
+    fn cold_boot_candidates(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        if self.fixed.read().is_some() {
+            return None;
+        }
+        let mut out: Vec<Arc<dyn Proxy>> = Vec::new();
+        macro_rules! consider {
+            ($p:expr) => {{
+                let p: &Arc<dyn Proxy> = $p;
+                if p.alive() || p.last_delay() > 0 {
+                    // Someone is usable or measured — the fallback contract
+                    // knows more than a race would.
+                    return None;
+                }
+                if out.len() < MAX_BOOTSTRAP_RACE {
+                    out.push(Arc::clone(p));
+                }
+            }};
+        }
+        for p in &self.static_proxies {
+            consider!(p);
+        }
+        for slot in &self.provider_slots {
+            let guard = slot.read();
+            for p in guard.iter() {
+                consider!(p);
+            }
+        }
+        (out.len() > 1).then_some(out)
+    }
+
     fn member_names(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .static_proxies
@@ -158,17 +206,25 @@ impl ProxyAdapter for FallbackGroup {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        // Blind boot: nothing alive, nothing measured. Race instead of
+        // handing the dial to member 0 (see `cold_boot_candidates`).
+        if let Some(candidates) = self.cold_boot_candidates() {
+            if let Some((winner, conn)) = bootstrap_race(&candidates, metadata).await {
+                winner.health().record_dial_success();
+                return Ok(conn);
+            }
+        }
         let proxy = self
             .first_alive()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
-        proxy.dial_tcp(metadata).await
+        record_dial(&proxy, proxy.dial_tcp(metadata).await)
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         let proxy = self
             .first_alive()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
-        proxy.dial_udp(metadata).await
+        record_dial(&proxy, proxy.dial_udp(metadata).await)
     }
 
     fn unwrap_proxy(&self, _metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
@@ -370,5 +426,90 @@ mod tests {
         b_ref.set_alive(false);
         assert_eq!(g.first_alive().unwrap().name(), "a");
         assert_eq!(ProxySelection::fixed(&g).as_deref(), Some(""));
+    }
+
+    /// Blind boot: every probe failed and nothing has been measured. The dial
+    /// must try every member, not hand itself to member 0 — that is the China
+    /// case, where the probe URL is what is blocked. `MockProxy::dial_tcp`
+    /// always fails, so no winner is possible; what this pins is that both
+    /// were *tried*.
+    #[tokio::test]
+    async fn a_blind_boot_races_every_member() {
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        a_ref.set_alive(false);
+        b_ref.set_alive(false);
+        let g = FallbackGroup::new("fb", vec![a, b]);
+
+        let _ = g.dial_tcp(&Metadata::default()).await;
+
+        assert!(
+            a_ref.dials() >= 1 && b_ref.dials() >= 1,
+            "죽었다고 표시됐다는 이유로 아무도 시도하지 않았다"
+        );
+    }
+
+    /// One alive member is enough to keep the fallback contract: the dial goes
+    /// to the first alive member in config order and nothing else is touched.
+    /// The race must never override the product's ordering.
+    #[tokio::test]
+    async fn no_race_while_any_member_is_alive() {
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        let c = MockProxy::new("c");
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        let c_ref = Arc::clone(&c);
+        a_ref.set_alive(false);
+        let g = FallbackGroup::new("fb", vec![a, b, c]);
+
+        let _ = g.dial_tcp(&Metadata::default()).await;
+
+        assert_eq!(a_ref.dials(), 0, "죽은 첫 멤버를 걸었다");
+        assert_eq!(b_ref.dials(), 1, "살아 있는 첫 멤버 하나만 걸어야 한다");
+        assert_eq!(c_ref.dials(), 0, "레이스가 순서를 무시했다");
+    }
+
+    /// A measurement anywhere means the probes reached their target, so the
+    /// blind case is over even if everyone is currently marked dead. No race:
+    /// the ordinary last-resort path (member 0) applies.
+    #[tokio::test]
+    async fn no_race_once_anyone_has_been_measured() {
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        b_ref.set_delay(30);
+        a_ref.set_alive(false);
+        b_ref.set_alive(false);
+        let g = FallbackGroup::new("fb", vec![a, b]);
+
+        let _ = g.dial_tcp(&Metadata::default()).await;
+
+        assert_eq!(a_ref.dials(), 1, "측정치가 있는데도 레이스를 돌았다");
+        assert_eq!(b_ref.dials(), 0);
+    }
+
+    /// A user pin disables the race: the pinned member is the user's answer.
+    #[tokio::test]
+    async fn a_pinned_member_skips_the_race() {
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        let a_ref = Arc::clone(&a);
+        let b_ref = Arc::clone(&b);
+        a_ref.set_alive(false);
+        b_ref.set_alive(false);
+        let g = FallbackGroup::new("fb", vec![a, b]);
+        g.force_set(Some("b"));
+
+        let _ = g.dial_tcp(&Metadata::default()).await;
+
+        assert_eq!(
+            a_ref.dials() + b_ref.dials(),
+            1,
+            "핀이 있으면 레이스 없이 한 멤버만 걸어야 한다"
+        );
     }
 }
