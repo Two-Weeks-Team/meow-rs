@@ -67,14 +67,9 @@ impl fmt::Display for NameServerUrl {
     }
 }
 
-/// A nameserver entry — a [`NameServerUrl`] plus an optional `#PROXY` tag
-/// telling the resolver to tunnel queries through the named proxy.
-///
-/// See [ADR-0012](../../../../docs/adr/0012-dns-via-proxy.md) for the
-/// design (issue #67 phase 2). Only the plain `Udp` / `Tcp` URL forms
-/// accept a `#PROXY` fragment in this slice; `Tls` / `Https` already use
-/// `#` for SNI and need the `?proxy=NAME` query-string disambiguator
-/// from the ADR, which is left for a follow-up.
+/// A nameserver URL plus an optional proxy. Plain UDP/TCP uses `#PROXY`;
+/// TLS/HTTPS uses `?proxy=<percent-encoded name>` and keeps `#SNI` intact.
+/// Other HTTPS query parameters remain part of the upstream request URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameServerEntry {
     pub url: NameServerUrl,
@@ -87,8 +82,7 @@ impl NameServerEntry {
     }
 
     /// Parse a nameserver string, returning the parsed `NameServerUrl` plus
-    /// the optional proxy name if a `#PROXY` fragment was present on a
-    /// plain (Udp/Tcp) entry.
+    /// the optional proxy name from `#PROXY` (UDP/TCP) or `?proxy=` (TLS/HTTPS).
     pub fn parse(s: &str) -> Result<Self, NameServerParseError> {
         let s = s.trim();
         if s.is_empty() {
@@ -100,6 +94,53 @@ impl NameServerEntry {
         // fragment is SNI — leave it intact and let NameServerUrl::parse
         // consume it normally.
         let is_plain_form = !(s.starts_with("tls://") || s.starts_with("https://"));
+        if !is_plain_form {
+            let (head, fragment) = s.split_once('#').map_or((s, None), |(h, f)| (h, Some(f)));
+            if let Some((base, query)) = head.split_once('?') {
+                let mut proxy = None;
+                let mut remaining = Vec::new();
+                for part in query.split('&') {
+                    let (key, value) = part
+                        .split_once('=')
+                        .map_or((part, None), |(k, v)| (k, Some(v)));
+                    if decode_proxy_component(key)? == "proxy" {
+                        if proxy.is_some() {
+                            return Err(NameServerParseError::InvalidProxyDirective);
+                        }
+                        let decoded = decode_proxy_component(
+                            value.ok_or(NameServerParseError::InvalidProxyDirective)?,
+                        )?;
+                        if decoded.trim().is_empty() || decoded.chars().any(char::is_control) {
+                            return Err(NameServerParseError::InvalidProxyDirective);
+                        }
+                        proxy = Some(decoded);
+                    } else {
+                        remaining.push(part);
+                    }
+                }
+                if s.starts_with("tls://") && !remaining.is_empty() {
+                    return Err(NameServerParseError::InvalidProxyDirective);
+                }
+                let mut url = base.to_string();
+                if !remaining.is_empty() {
+                    // An HTTPS URL without an explicit path still has the
+                    // default DNS path, before its retained query string.
+                    if !base["https://".len()..].contains('/') {
+                        url.push_str("/dns-query");
+                    }
+                    url.push('?');
+                    url.push_str(&remaining.join("&"));
+                }
+                if let Some(sni) = fragment {
+                    url.push('#');
+                    url.push_str(sni);
+                }
+                return Ok(Self {
+                    url: NameServerUrl::parse(&url)?,
+                    proxy,
+                });
+            }
+        }
         if is_plain_form {
             if let Some(idx) = s.find('#') {
                 let head = &s[..idx];
@@ -116,6 +157,28 @@ impl NameServerEntry {
         }
         Ok(Self::plain(NameServerUrl::parse(s)?))
     }
+}
+
+/// Strict UTF-8 form-query decoding. A malformed directive must not silently
+/// become an unproxied upstream. No URL dependency is needed for one field.
+fn decode_proxy_component(value: &str) -> Result<String, NameServerParseError> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'%' => {
+                let high = bytes.next().and_then(|c| char::from(c).to_digit(16));
+                let low = bytes.next().and_then(|c| char::from(c).to_digit(16));
+                match (high, low) {
+                    (Some(h), Some(l)) => decoded.push((h * 16 + l) as u8),
+                    _ => return Err(NameServerParseError::InvalidProxyDirective),
+                }
+            }
+            b'+' => decoded.push(b' '),
+            other => decoded.push(other),
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| NameServerParseError::InvalidProxyDirective)
 }
 
 impl From<NameServerUrl> for NameServerEntry {
@@ -345,6 +408,8 @@ fn parse_port(s: &str) -> Result<u16, NameServerParseError> {
 pub enum NameServerParseError {
     #[error("nameserver string is empty")]
     EmptyInput,
+    #[error("invalid, empty, or duplicate nameserver proxy directive")]
+    InvalidProxyDirective,
     #[error(
         "nameserver uses the 'quic' scheme which is not yet supported; tracked as roadmap M1.E-6 / M2. Use 'tls://' or 'https://' for now."
     )]
@@ -367,6 +432,63 @@ pub enum NameServerParseError {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[cfg(feature = "encrypted")]
+    #[test]
+    fn encrypted_proxy_query_preserves_sni_and_http_query() {
+        let unproxied = "https://1.1.1.1/custom?token=a%2Bb&client=field#dns.example";
+        assert_eq!(
+            NameServerEntry::parse(unproxied).unwrap(),
+            NameServerEntry::plain(NameServerUrl::parse(unproxied).unwrap())
+        );
+        for scheme in ["tls", "https"] {
+            let entry = NameServerEntry::parse(&format!(
+                "{scheme}://1.1.1.1?proxy=%ED%95%9C%EA%B5%AD%20A%2BB#dns.example"
+            ))
+            .unwrap();
+            assert_eq!(entry.proxy.as_deref(), Some("한국 A+B"));
+            match entry.url {
+                NameServerUrl::Tls { sni, .. } => assert_eq!(sni, "dns.example"),
+                NameServerUrl::Https { path, sni, .. } => {
+                    assert_eq!(path, "/dns-query");
+                    assert_eq!(sni, "dns.example");
+                }
+                _ => panic!("encrypted transport lost"),
+            }
+        }
+        let entry = NameServerEntry::parse(
+            "https://1.1.1.1/resolve?token=a%2Bb&proxy=Korea&other=c#dns.example",
+        )
+        .unwrap();
+        assert_eq!(entry.proxy.as_deref(), Some("Korea"));
+        assert!(
+            matches!(entry.url, NameServerUrl::Https { path, .. } if path == "/resolve?token=a%2Bb&other=c")
+        );
+    }
+
+    #[cfg(feature = "encrypted")]
+    #[test]
+    fn encrypted_proxy_query_rejects_malformed_directives() {
+        for query in [
+            "proxy",
+            "proxy=",
+            "proxy=%",
+            "proxy=%GG",
+            "proxy=%FF",
+            "proxy=%00",
+            "proxy=%20",
+            "proxy=A&proxy=B",
+            "%70roxy=",
+            "proxy=A&%70roxy=B",
+        ] {
+            for scheme in ["tls", "https"] {
+                assert!(
+                    NameServerEntry::parse(&format!("{scheme}://1.1.1.1?{query}")).is_err(),
+                    "accepted {scheme} {query}"
+                );
+            }
+        }
+    }
 
     fn ip4(a: u8, b: u8, c: u8, d: u8) -> HostOrIp {
         HostOrIp::Ip(IpAddr::V4(Ipv4Addr::new(a, b, c, d)))

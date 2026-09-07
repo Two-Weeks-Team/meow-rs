@@ -18,6 +18,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
+#[cfg(all(test, feature = "encrypted"))]
+#[path = "encrypted_proxy_tests.rs"]
+mod encrypted_proxy_tests;
+
 #[cfg(feature = "encrypted")]
 use {rustls::pki_types::ServerName, std::convert::TryFrom, tokio_rustls::TlsConnector};
 
@@ -340,33 +344,13 @@ impl DnsClient {
         wire: &[u8],
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
-        if let Some(proxy) = self.proxy.as_ref() {
-            let addr = match &self.transport {
-                Transport::Udp { addr } | Transport::Tcp { addr } => *addr,
-                Transport::RCode { .. } => {
-                    return Err(ClientError::Protocol(
-                        "rcode transport should not perform network exchange",
-                    ));
-                }
-                #[cfg(feature = "encrypted")]
-                Transport::Dot { .. } | Transport::Doh { .. } => {
-                    // DoT/DoH-over-proxy needs TLS layered on a Box<dyn
-                    // ProxyConn>; the upstream tokio_rustls TlsConnector
-                    // is generic over the IO stream but the call sites
-                    // here aren't wired yet. ADR-0012 marks it
-                    // follow-up. Refuse so misconfiguration is loud.
-                    return Err(ClientError::Tls(
-                        "DoT/DoH routing through a proxy is not implemented yet \
-                        (issue #67 phase 2 follow-up); use plain udp:// or tcp:// for \
-                        a #PROXY-tagged nameserver"
-                            .to_string(),
-                    ));
-                }
-            };
-            let response = proxy_tcp_exchange(proxy, addr, wire).await?;
-            return decode_validated_response(&response, expected);
-        }
         match &self.transport {
+            Transport::Udp { addr } | Transport::Tcp { addr } if self.proxy.is_some() => {
+                let mut stream = connect_stream(*addr, self.proxy.as_ref()).await?;
+                write_lp(&mut stream, wire).await?;
+                let response = read_lp(&mut stream).await?;
+                decode_validated_response(&response, expected)
+            }
             Transport::Udp { addr } => udp_exchange(*addr, wire, expected).await,
             Transport::Tcp { addr } => {
                 let response = tcp_exchange(*addr, wire).await?;
@@ -377,7 +361,8 @@ impl DnsClient {
             )),
             #[cfg(feature = "encrypted")]
             Transport::Dot { addr, sni, tls } => {
-                let response = dot_exchange(*addr, sni, Arc::clone(tls), wire).await?;
+                let response =
+                    dot_exchange(*addr, sni, Arc::clone(tls), wire, self.proxy.as_ref()).await?;
                 decode_validated_response(&response, expected)
             }
             #[cfg(feature = "encrypted")]
@@ -387,7 +372,9 @@ impl DnsClient {
                 path,
                 tls,
             } => {
-                let response = doh_exchange(*addr, sni, path, Arc::clone(tls), wire).await?;
+                let response =
+                    doh_exchange(*addr, sni, path, Arc::clone(tls), wire, self.proxy.as_ref())
+                        .await?;
                 decode_validated_response(&response, expected)
             }
         }
@@ -441,11 +428,13 @@ fn socket_label(addr: SocketAddr, default_port: u16) -> String {
     }
 }
 
-async fn proxy_tcp_exchange(
-    proxy: &DnsProxy,
+async fn connect_stream(
     addr: SocketAddr,
-    wire: &[u8],
-) -> Result<Vec<u8>, ClientError> {
+    proxy: Option<&DnsProxy>,
+) -> Result<Box<dyn meow_common::ProxyConn>, ClientError> {
+    let Some(proxy) = proxy else {
+        return Ok(Box::new(factory().connect_tcp(addr).await?));
+    };
     use meow_common::{ConnType, Metadata, Network};
     let metadata = Metadata {
         network: Network::Tcp,
@@ -455,12 +444,12 @@ async fn proxy_tcp_exchange(
         dst_port: addr.port(),
         ..Default::default()
     };
-    let mut stream = proxy
+    // A failed proxy dial returns immediately. It must never expose the DNS
+    // query to a direct connection or downgrade an encrypted transport.
+    proxy
         .dial_tcp(&metadata)
         .await
-        .map_err(|e| io::Error::other(format!("dns-via-proxy dial: {e}")))?;
-    write_lp(&mut stream, wire).await?;
-    read_lp(&mut stream).await
+        .map_err(|e| ClientError::Io(io::Error::other(format!("dns-via-proxy dial: {e}"))))
 }
 
 fn ip_from_record(rec: &Record) -> Option<IpAddr> {
@@ -617,8 +606,9 @@ async fn dot_exchange(
     sni: &str,
     tls: Arc<rustls::ClientConfig>,
     wire: &[u8],
+    proxy: Option<&DnsProxy>,
 ) -> Result<Vec<u8>, ClientError> {
-    let tcp = factory().connect_tcp(addr).await?;
+    let tcp = connect_stream(addr, proxy).await?;
     let connector = TlsConnector::from(tls);
     let server_name = ServerName::try_from(sni.to_string())
         .map_err(|e| ClientError::Tls(format!("invalid SNI: {e}")))?;
@@ -637,8 +627,9 @@ async fn doh_exchange(
     path: &str,
     tls: Arc<rustls::ClientConfig>,
     wire: &[u8],
+    proxy: Option<&DnsProxy>,
 ) -> Result<Vec<u8>, ClientError> {
-    let tcp = factory().connect_tcp(addr).await?;
+    let tcp = connect_stream(addr, proxy).await?;
     let connector = TlsConnector::from(tls);
     let server_name = ServerName::try_from(sni.to_string())
         .map_err(|e| ClientError::Tls(format!("invalid SNI: {e}")))?;
