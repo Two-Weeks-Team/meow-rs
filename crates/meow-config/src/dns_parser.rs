@@ -327,6 +327,25 @@ async fn build_nameserver_policy(
         let mut patterns = Vec::new();
         for expanded_key in expand_policy_keys(key) {
             let key_lower = expanded_key.to_ascii_lowercase();
+            if let Some(expression) = expanded_key.strip_prefix("regexp:") {
+                let regex = regex::Regex::new(expression).map_err(|e| {
+                    anyhow::anyhow!("invalid nameserver-policy regex '{expression}': {e}")
+                })?;
+                patterns.push(PolicyPattern::Matcher(Arc::new(move |domain| {
+                    regex.is_match(domain)
+                })));
+                continue;
+            }
+            if let Some(keyword) = expanded_key.strip_prefix("keyword:") {
+                if keyword.is_empty() {
+                    anyhow::bail!("empty nameserver-policy keyword");
+                }
+                let keyword = keyword.to_string();
+                patterns.push(PolicyPattern::Matcher(Arc::new(move |domain| {
+                    domain.contains(&keyword)
+                })));
+                continue;
+            }
             if let Some(category) = key_lower.strip_prefix("geosite:") {
                 let category = category.trim();
                 if category.is_empty() {
@@ -398,6 +417,10 @@ enum PolicyPattern {
 
 fn expand_policy_keys(key: &str) -> Vec<String> {
     let key = key.trim();
+    // Regex quantifiers may contain commas; never split the expression.
+    if key.starts_with("regexp:") || key.starts_with("keyword:") {
+        return vec![key.to_string()];
+    }
     let lower = key.to_ascii_lowercase();
     if lower.starts_with("geosite:") {
         return key["geosite:".len()..]
@@ -453,28 +476,19 @@ async fn build_policy_resolvers(
     for url_str in &url_strs {
         match NameServerEntry::parse(url_str) {
             Ok(entry) => {
+                let proxy = match entry.proxy.as_deref() {
+                    Some(name) => Some(proxy_registry.get(name).cloned().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "nameserver-policy entry '{key}' references unknown proxy '{name}'"
+                        )
+                    })?),
+                    None => None,
+                };
                 let Some(url) =
                     resolve_policy_hostname_url(entry.url, key, url_str, bootstrap_clients).await
                 else {
                     continue;
                 };
-                // `#PROXY` fragment: route this upstream's exchanges through
-                // the named adapter, matching the nameserver/fallback entry
-                // semantics (issue #67 phase 2, ADR-0012). An unknown name
-                // degrades to a direct dial like the main path does, but
-                // warn loudly — a policy upstream is usually proxied
-                // precisely because the direct path is untrusted.
-                let proxy = entry.proxy.as_deref().and_then(|name| {
-                    let handle = proxy_registry.get(name).cloned();
-                    if handle.is_none() {
-                        warn!(
-                            "nameserver-policy entry '{}': URL '{}' references unknown \
-                            proxy '{}'; dialing direct",
-                            key, url_str, name
-                        );
-                    }
-                    handle
-                });
                 let resolver =
                     Resolver::build_single_resolver_with_proxy(&url, &empty_resolved, proxy);
                 resolvers.push(resolver);
@@ -1238,20 +1252,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_resolver_unknown_proxy_name_degrades_to_direct() {
+    async fn policy_resolver_unknown_proxy_name_is_an_error() {
         let registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
-        let value = crate::raw::RawNspValue::Many(vec![
-            "tcp://8.8.8.8#NoSuchProxy".to_string(),
-            "1.1.1.1#NoSuchProxy".to_string(),
+        for url in [
+            "tcp://8.8.8.8#NoSuchProxy",
+            "1.1.1.1#NoSuchProxy",
+            "https://1.1.1.1/dns-query?proxy=NoSuchProxy#cloudflare-dns.com",
+            "tls://1.1.1.1?proxy=NoSuchProxy#cloudflare-dns.com",
+        ] {
+            let value = crate::raw::RawNspValue::One(url.to_string());
+            let result = build_policy_resolvers("geosite:gfw", &value, &[], &registry).await;
+            assert!(
+                result.is_err(),
+                "unknown proxy must never dial direct: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_matches_exact_suffix_and_regex_without_splitting_quantifiers() {
+        let map = HashMap::from([
+            (
+                "exact.example,+.suffix.example".into(),
+                crate::raw::RawNspValue::One("https://223.5.5.5/dns-query".into()),
+            ),
+            (
+                r"regexp:^cn[0-9]{1,3}\.example$".into(),
+                crate::raw::RawNspValue::One("https://223.5.5.5/dns-query".into()),
+            ),
         ]);
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry)
+        let policy = build_nameserver_policy(&map, None, &[], &HashMap::new())
             .await
-            .expect("unknown proxy name must not fail the policy build");
-        assert_eq!(resolvers.len(), 2);
+            .unwrap();
+        for domain in [
+            "exact.example",
+            "suffix.example",
+            "www.suffix.example",
+            "cn123.example",
+        ] {
+            let entry = policy
+                .lookup(domain)
+                .unwrap_or_else(|| panic!("unmatched: {domain}"));
+            assert_eq!(entry.nameservers.len(), 1);
+            assert!(!entry.nameservers[0].is_proxied());
+        }
+        for domain in ["child.exact.example", "cn1234.example", "unrelated.example"] {
+            assert!(
+                policy.lookup(domain).is_none(),
+                "unexpected match: {domain}"
+            );
+        }
         assert!(
-            resolvers.iter().all(|r| !r.is_proxied()),
-            "unknown names degrade to direct dials"
+            Arc::ptr_eq(
+                &policy.lookup("suffix.example").unwrap().nameservers[0],
+                &policy.lookup("exact.example").unwrap().nameservers[0]
+            ),
+            "combined domain entry shares its DNS client"
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_policy_regex_is_an_error() {
+        let map = HashMap::from([(
+            "regexp:[".into(),
+            crate::raw::RawNspValue::One("https://223.5.5.5/dns-query".into()),
+        )]);
+        assert!(build_nameserver_policy(&map, None, &[], &HashMap::new())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

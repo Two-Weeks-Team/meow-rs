@@ -49,12 +49,6 @@ pub enum BootstrapError {
     },
     #[error("nameserver '{nameserver}' references proxy '{proxy}', which is not defined")]
     UnknownProxy { nameserver: String, proxy: String },
-    #[error(
-        "nameserver '{nameserver}' uses proxy '{proxy}' on a tls:///https:// entry; \
-        DoT/DoH routing through a proxy is not implemented yet — use plain udp:// or tcp:// \
-        (issue #67 phase 2 follow-up)"
-    )]
-    EncryptedProxyUnsupported { nameserver: String, proxy: String },
 }
 
 /// Broadcast channel used to share a singleflight lookup result.
@@ -576,8 +570,8 @@ impl Resolver {
     /// bootstrap DNS lookup for any encrypted upstream that uses a
     /// hostname.
     ///
-    /// `proxy_registry` resolves any `#PROXY` references on plain
-    /// (`udp://`/`tcp://`) entries (issue #67 phase 2). Pass an empty map
+    /// `proxy_registry` resolves `#PROXY` references on UDP/TCP entries and
+    /// `?proxy=` references on TLS/HTTPS entries. Pass an empty map
     /// when proxies aren't yet built — entries that reference proxies
     /// will then be rejected with `BootstrapError::UnknownProxy`.
     #[allow(clippy::too_many_arguments)]
@@ -609,15 +603,6 @@ impl Resolver {
             let Some(p) = entry.proxy.as_ref() else {
                 continue;
             };
-            if matches!(
-                entry.url,
-                NameServerUrl::Tls { .. } | NameServerUrl::Https { .. }
-            ) {
-                return Err(BootstrapError::EncryptedProxyUnsupported {
-                    nameserver: entry.url.to_string(),
-                    proxy: p.clone(),
-                });
-            }
             if !proxy_registry.contains_key(p.as_str()) {
                 return Err(BootstrapError::UnknownProxy {
                     nameserver: entry.url.to_string(),
@@ -1059,27 +1044,21 @@ impl Resolver {
     async fn do_lookup(&self, host: &str) -> Option<Vec<IpAddr>> {
         debug!("DNS lookup: {}", host);
 
+        // A matched policy is an explicit routing choice, not a preference.
+        // Failure must not leak this query to global/fallback nameservers.
+        if let Some(policy) = &self.policy {
+            if let Some(entry) = policy.lookup(host) {
+                let result = query_pool(&entry.nameservers, host).await?;
+                self.cache
+                    .put_with_source(host, &result.ips, result.ttl, Some(&result.source));
+                return Some(result.ips);
+            }
+        }
+
         // Domain-gate: skip primary entirely, go straight to fallback.
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(host) {
                 return self.try_fallback(host).await;
-            }
-        }
-
-        // Nameserver-policy lookup.
-        if let Some(policy) = &self.policy {
-            if let Some(entry) = policy.lookup(host) {
-                if let Some(result) = query_pool(&entry.nameservers, host).await {
-                    if let Some(ff) = &self.fallback_filter {
-                        if ff.ip_gated(&result.ips) {
-                            return self.try_fallback(host).await;
-                        }
-                    }
-                    self.cache
-                        .put_with_source(host, &result.ips, result.ttl, Some(&result.source));
-                    return Some(result.ips);
-                }
-                // Policy lookup failed: fall through to global nameservers.
             }
         }
 
@@ -1099,23 +1078,21 @@ impl Resolver {
     }
 
     /// Forward a non-A/AAAA query (TXT, MX, SRV, HTTPS, SOA, PTR, …) through
-    /// the same nameserver pipeline as ordinary lookups: domain-gate → policy
-    /// → main → fallback. Returns the upstream `Message` so callers can
+    /// the same nameserver pipeline as ordinary lookups: matched policy, or
+    /// domain-gate → main → fallback. Returns the upstream `Message` so callers can
     /// re-emit the answer section verbatim in their response.
     ///
     /// Skips the `ip_gated` fallback hop — the fallback-filter's IP-CIDR /
     /// GeoIP gates only apply to address records.
     pub async fn forward_generic(&self, domain: &str, record_type: RecordType) -> Option<Message> {
+        if let Some(policy) = &self.policy {
+            if let Some(entry) = policy.lookup(domain) {
+                return query_pool_generic(&entry.nameservers, domain, record_type).await;
+            }
+        }
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(domain) {
                 return self.try_fallback_generic(domain, record_type).await;
-            }
-        }
-        if let Some(policy) = &self.policy {
-            if let Some(entry) = policy.lookup(domain) {
-                if let Some(l) = query_pool_generic(&entry.nameservers, domain, record_type).await {
-                    return Some(l);
-                }
             }
         }
         if let Some(l) = query_pool_generic(&self.main, domain, record_type).await {
@@ -2024,6 +2001,62 @@ mod tests {
         pol.insert_exact("corp.example".to_string(), entry);
         assert!(pol.lookup("corp.example").is_some(), "exact match must hit");
         assert!(pol.lookup("other.example").is_none(), "non-match must miss");
+    }
+
+    #[tokio::test]
+    async fn failed_direct_policy_never_queries_global_or_fallback() {
+        let policy_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let policy_addr = policy_server.local_addr().unwrap();
+        let global_server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let global_addr = global_server.local_addr().unwrap();
+        let failing = tokio::spawn(async move {
+            // Fail all three policy queries: A + AAAA, then TXT.
+            for _ in 0..3 {
+                let (stream, _) = policy_server.accept().await.unwrap();
+                drop(stream);
+            }
+        });
+        let mut resolver = Resolver::new(
+            vec![global_addr],
+            vec![global_addr],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+        );
+        let mut policy = NameserverPolicy::new();
+        policy.insert_exact(
+            "example.com".to_string(),
+            PolicyEntry {
+                nameservers: vec![Arc::new(DnsClient::tcp(policy_addr))],
+            },
+        );
+        resolver.policy = Some(policy);
+        // Even an explicit fallback filter must not override matched policy.
+        let mut filter_domain = DomainTrie::new();
+        assert!(filter_domain.insert("example.com", ()));
+        resolver.fallback_filter = Some(FallbackFilter {
+            geoip_enabled: false,
+            geoip_code: "CN".into(),
+            ipcidr: vec![],
+            domain: filter_domain,
+            geoip_reader: None,
+        });
+        assert!(resolver.lookup_ipv4("example.com").await.is_none());
+        assert!(resolver
+            .forward_generic("example.com", RecordType::TXT)
+            .await
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(1), failing)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut buffer = [0; 4096];
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            global_server.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
     }
 
     // nameserver-policy wildcard match (subdomain + root).
