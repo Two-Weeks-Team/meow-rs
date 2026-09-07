@@ -5,7 +5,7 @@ use meow_dns::fakeip::{FileStore, MemoryStore, Pool, Skipper, SkipperMode, Store
 use meow_dns::resolver::{
     FallbackFilter, HostEntry, NameserverPolicy, NameserverPolicyMatcher, PolicyEntry,
 };
-use meow_dns::upstream::{NameServerEntry, NameServerUrl};
+use meow_dns::upstream::{NameServerEntry, NameServerParseError, NameServerUrl};
 use meow_dns::{DnsClient, HostOrIp, Resolver};
 use meow_trie::DomainTrie;
 use std::collections::HashMap;
@@ -492,6 +492,13 @@ async fn build_policy_resolvers(
                 let resolver =
                     Resolver::build_single_resolver_with_proxy(&url, &empty_resolved, proxy);
                 resolvers.push(resolver);
+            }
+            Err(e @ NameServerParseError::InvalidProxyDirective) => {
+                // Never discard an explicit but malformed routing directive,
+                // even when another nameserver in the policy is valid.
+                return Err(anyhow::Error::new(e).context(format!(
+                    "nameserver-policy entry '{key}' has an invalid proxy directive"
+                )));
             }
             Err(e) => {
                 warn!(
@@ -1249,6 +1256,41 @@ mod tests {
             resolvers[0].is_proxied(),
             "registry adapter must be wired into the policy client"
         );
+    }
+
+    #[tokio::test]
+    async fn policy_invalid_proxy_directive_is_fatal_with_valid_nameserver() {
+        for scheme in ["tls", "https"] {
+            for query in [
+                "proxy",
+                "proxy=",
+                "proxy=%",
+                "proxy=%GG",
+                "proxy=%FF",
+                "proxy=%00",
+                "proxy=%20",
+                "proxy=A&proxy=B",
+                "%70roxy=",
+                "proxy=A&%70roxy=B",
+            ] {
+                let invalid = format!("{scheme}://127.0.0.1?{query}");
+                for invalid_first in [true, false] {
+                    let mut urls = vec![invalid.clone(), "127.0.0.1".to_string()];
+                    if !invalid_first {
+                        urls.reverse();
+                    }
+                    let map = HashMap::from([(
+                        "internal.example".to_string(),
+                        crate::raw::RawNspValue::Many(urls),
+                    )]);
+                    let result = build_nameserver_policy(&map, None, &[], &HashMap::new()).await;
+                    assert!(
+                        result.is_err(),
+                        "invalid proxy directive must fail policy loading: {invalid}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
