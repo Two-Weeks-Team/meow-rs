@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -1283,6 +1283,30 @@ impl PacketConn {
             pool_session,
         }
     }
+}
+
+/// Open a one-off XUDP packet connection over a VLESS CommandMux connection.
+///
+/// This is the non-pooled variant used by VLESS `packet-encoding: xudp` when
+/// the proxy itself did not enable a mux pool. It reuses the same Mux.Cool
+/// frame codec as the pooled path.
+pub(crate) async fn new_packet_conn(
+    conn: Box<dyn ProxyConn>,
+    host: &str,
+    port: u16,
+) -> io::Result<PacketConn> {
+    let session = MuxCoolSession::client(conn).await?;
+    let parts = session.open_stream_parts(host, port, true).await?;
+    let destination = host.parse::<IpAddr>().ok().map_or_else(
+        || "0.0.0.0:0".parse().expect("static placeholder"),
+        |ip| SocketAddr::new(ip, port),
+    );
+    let pool_session = Arc::new(MuxSession {
+        kind: super::client::SessionKind::MuxCool(Arc::clone(&session)),
+        streams: AtomicUsize::new(1),
+        last_used_ms: meow_common::atomic::AtomicU::new(0),
+    });
+    Ok(PacketConn::new(parts, pool_session, destination))
 }
 
 impl Drop for PacketConn {
