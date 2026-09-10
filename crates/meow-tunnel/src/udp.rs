@@ -25,6 +25,9 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 pub struct UdpSession {
     pub conn: Box<dyn ProxyPacketConn>,
     pub proxy_name: Arc<str>,
+    /// Original-destination sessions keep their resolved peer until eviction.
+    /// DNS refresh must not change the wire address under an existing reader.
+    pinned_destination: Option<SocketAddr>,
     /// Monotonic millis since process start. Bumped on every fast-path forward
     /// so idle sessions can be evicted by [`spawn_nat_sweeper`].
     last_activity_ms: AtomicU,
@@ -35,6 +38,7 @@ impl UdpSession {
         Self {
             conn,
             proxy_name,
+            pinned_destination: None,
             last_activity_ms: AtomicU::new(monotonic_ms() as meow_common::atomic::Uint),
         }
     }
@@ -118,27 +122,63 @@ pub fn spawn_nat_sweeper(
 }
 
 /// Handle a UDP packet: look up or create a NAT session.
-pub async fn handle_udp(
+pub async fn handle_udp(tunnel: &TunnelInner, data: &[u8], src: SocketAddr, metadata: Metadata) {
+    let _ = forward_udp(tunnel, data, src, metadata, None).await;
+}
+
+/// Forward a datagram while retaining the application's destination as its
+/// NAT identity. Packet-stack callers use this to keep distinct fake-IP flows
+/// separate even when their hostnames resolve to the same real endpoint.
+/// Returns the session and real destination so the caller can read replies
+/// and translate only the fake-IP address, preserving the peer's source port.
+/// The real destination stays pinned for that session; a new session resolves
+/// again after eviction or failure.
+/// Existing callers of `handle_udp` retain their resolved-destination keys.
+pub async fn handle_udp_with_nat_destination(
+    tunnel: &TunnelInner,
+    data: &[u8],
+    src: SocketAddr,
+    metadata: Metadata,
+    nat_destination: SocketAddr,
+) -> Option<(Arc<UdpSession>, SocketAddr)> {
+    forward_udp(tunnel, data, src, metadata, Some(nat_destination)).await
+}
+
+async fn forward_udp(
     tunnel: &TunnelInner,
     data: &[u8],
     src: SocketAddr,
     mut metadata: Metadata,
-) {
-    // Fake-IP → host rewrite (no-op outside fake-IP mode aside from a
-    // snooping-cache hostname fill-in).
-    tunnel.pre_handle_metadata(&mut metadata);
+    nat_destination: Option<SocketAddr>,
+) -> Option<(Arc<UdpSession>, SocketAddr)> {
+    let pinned = nat_destination
+        .and_then(|dst| {
+            tunnel
+                .nat_table
+                .get(&(src, dst))
+                .map(|s| Arc::clone(s.value()))
+        })
+        .and_then(|session| session.pinned_destination.map(|dst| (session, dst)));
+    if let Some((_, dst)) = &pinned {
+        metadata.dst_ip = Some(dst.ip());
+        metadata.dst_port = dst.port();
+    } else {
+        // Fake-IP → host rewrite (no-op outside fake-IP mode aside from a
+        // snooping-cache hostname fill-in).
+        tunnel.pre_handle_metadata(&mut metadata);
 
-    // Pre-resolve metadata (host -> real IP if rules need it). UDP keeps
-    // the eager pre_resolve + resolve_proxy pair (no lazy enrichment): the
-    // NAT session key below requires a resolved dst_ip regardless of what
-    // the rules demand.
-    tunnel.pre_resolve(&mut metadata).await;
+        // Pre-resolve metadata (host -> real IP if rules need it). UDP keeps
+        // the eager pre_resolve + resolve_proxy pair (no lazy enrichment): the
+        // NAT session key below requires a resolved dst_ip regardless of what
+        // the rules demand.
+        tunnel.pre_resolve(&mut metadata).await;
 
-    // Rule-demand gating is only an optimization. UDP still requires a real
-    // address for its NAT key and outbound packet API, including after a
-    // fake-IP was rewritten back to a hostname under domain-only rules.
-    if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-        metadata.dst_ip = tunnel.resolver.resolve_ip_real(&metadata.host).await;
+        // Rule-demand gating is only an optimization. UDP still requires a real
+        // address for its NAT key and outbound packet API, including after a
+        // fake-IP was rewritten back to a hostname under domain-only rules.
+        if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
+            metadata.dst_ip = tunnel.resolver.resolve_ip_real(&metadata.host).await;
+        }
     }
 
     // Build destination SocketAddr for the NAT key.
@@ -150,10 +190,10 @@ pub async fn handle_udp(
             "UDP {}: dst_ip not resolved after pre_resolve — dropping",
             metadata.remote_address()
         );
-        return;
+        return None;
     };
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
-    let key = (src, dst_addr);
+    let key = (src, nat_destination.unwrap_or(dst_addr));
 
     // Fast path: existing session — forward and return.
     //
@@ -172,8 +212,15 @@ pub async fn handle_udp(
     //      API. Fires whenever an established session's upstream has died and
     //      the app sends another datagram (common for QUIC / long-lived UDP).
     // Holding only the cloned `Arc` keeps the session alive with no lock held.
-    let existing = tunnel.nat_table.get(&key).map(|s| Arc::clone(s.value()));
+    let existing = pinned
+        .map(|(session, _)| session)
+        .or_else(|| tunnel.nat_table.get(&key).map(|s| Arc::clone(s.value())));
     if let Some(session) = existing {
+        let dst_addr = if nat_destination.is_some() {
+            session.pinned_destination.unwrap_or(dst_addr)
+        } else {
+            dst_addr
+        };
         if let Err(e) = session.conn.write_packet(data, &dst_addr).await {
             debug!("UDP write error for {} -> {}: {}", src, dst_addr, e);
             // Compare-and-remove: evict only the session that actually failed.
@@ -184,10 +231,11 @@ pub async fn handle_udp(
             tunnel
                 .nat_table
                 .remove_if(&key, |_, s| Arc::ptr_eq(s, &session));
+            return None;
         } else {
             session.touch();
         }
-        return;
+        return Some((session, dst_addr));
     }
 
     // Slow path: new session — match rules and dial.
@@ -206,7 +254,7 @@ pub async fn handle_udp(
     } else {
         let Some(matched) = tunnel.resolve_proxy(&metadata) else {
             warn!("no matching rule for UDP {}", metadata.remote_address());
-            return;
+            return None;
         };
         matched
     };
@@ -222,7 +270,9 @@ pub async fn handle_udp(
 
     match proxy.dial_udp(&metadata).await {
         Ok(conn) => {
-            let session = Arc::new(UdpSession::new(conn, Arc::from(proxy.name())));
+            let mut session = UdpSession::new(conn, Arc::from(proxy.name()));
+            session.pinned_destination = nat_destination.map(|_| dst_addr);
+            let session = Arc::new(session);
             // Claim the key atomically before the first write. The dial above
             // is a long await with the key unclaimed, so two concurrent
             // handle_udp calls for the same brand-new (src, dst) can both
@@ -255,15 +305,26 @@ pub async fn handle_udp(
                     );
                 }
             }
+            // A concurrent dial may have won this original tuple while DNS
+            // changed. Carry this datagram on the winner's same pinned peer.
+            let dst_addr = if nat_destination.is_some() {
+                winner.pinned_destination.unwrap_or(dst_addr)
+            } else {
+                dst_addr
+            };
             if let Err(e) = winner.conn.write_packet(data, &dst_addr).await {
                 warn!("UDP initial write error for {} -> {}: {}", src, dst_addr, e);
                 tunnel
                     .nat_table
                     .remove_if(&key, |_, s| Arc::ptr_eq(s, &winner));
+                None
+            } else {
+                Some((winner, dst_addr))
             }
         }
         Err(e) => {
             warn!("UDP dial error for {} -> {}: {}", src, dst_addr, e);
+            None
         }
     }
 }
