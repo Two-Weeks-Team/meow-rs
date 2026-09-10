@@ -58,6 +58,8 @@ mod route;
 #[cfg(any(test, target_os = "windows"))]
 mod tcp_dns;
 mod udp;
+#[cfg(target_os = "windows")]
+mod windows_device;
 #[cfg(any(test, target_os = "windows"))]
 mod wintun;
 
@@ -382,9 +384,10 @@ impl TunListener {
         };
 
         // Try up to 5 device names and IPs in case the previous instance
-        // left a stale adapter that hasn't been cleaned up yet (common on
-        // Windows after an unclean shutdown).  After the first retry fails,
-        // we also rotate the TUN IP to work around address conflicts.
+        // left a device that hasn't been cleaned up yet. Windows ownership
+        // collisions fail immediately; only other creation errors retry.
+        // After the first retry fails, we also rotate the TUN IP to work
+        // around address conflicts.
         //
         // Each attempt runs on a blocking thread; the outer caller's
         // TUN_STARTUP_TIMEOUT guards the overall time spent here.
@@ -426,19 +429,26 @@ impl TunListener {
             );
 
             match tokio::task::spawn_blocking(move || {
-                let mut builder = tun_rs::DeviceBuilder::new()
-                    .mtu(mtu)
-                    .ipv4(addr, prefix, None);
-                if let Some(n) = &name_for_closure {
-                    builder = builder.name(n);
-                }
-                // Pin the Wintun DLL we resolved above so tun-rs does not
-                // walk the process DLL search path.
                 #[cfg(target_os = "windows")]
                 {
-                    builder = builder.wintun_file(wintun_file).wintun_log(true);
+                    windows_device::create_owned(
+                        name_for_closure.as_deref().unwrap_or("meow-tun"),
+                        wintun_file,
+                        mtu,
+                        addr,
+                        prefix,
+                    )
                 }
-                builder.build_async()
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let mut builder = tun_rs::DeviceBuilder::new()
+                        .mtu(mtu)
+                        .ipv4(addr, prefix, None);
+                    if let Some(n) = &name_for_closure {
+                        builder = builder.name(n);
+                    }
+                    builder.build_async()
+                }
             })
             .await
             {
@@ -451,6 +461,12 @@ impl TunListener {
                     break;
                 }
                 Ok(Err(e)) => {
+                    // An ownership conflict is not a stale-device retry:
+                    // leave the existing interface untouched and fail startup.
+                    #[cfg(target_os = "windows")]
+                    if e.kind() == io::ErrorKind::AlreadyExists {
+                        return Err(Box::new(e));
+                    }
                     warn!("failed to create TUN device '{}': {e}", display_name);
                     last_err = Some(e.to_string());
                 }
@@ -787,8 +803,8 @@ impl TunListener {
 /// macOS only accepts `utunN` device names and picks one itself when none is
 /// given, so never invent a name there — pass the configured name through
 /// unchanged (suffix rotation would produce an invalid `utunN-1`). Elsewhere
-/// default to "meow-tun" and rotate a numeric suffix to sidestep stale
-/// adapters from unclean shutdowns (common with wintun).
+/// default to "meow-tun" and rotate a numeric suffix for creation retries.
+/// Windows ownership collisions are rejected before a retry is attempted.
 fn device_name_for_attempt(configured: Option<&str>, attempt: u32) -> Option<String> {
     if cfg!(target_os = "macos") {
         configured.map(str::to_string)
