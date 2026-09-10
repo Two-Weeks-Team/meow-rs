@@ -1,15 +1,29 @@
 //! RAII route installation for the TUN inbound's `auto-route`.
 //!
-//! v1 deliberately routes only the fake-IP range into the device (see the
-//! module docs in `mod.rs` for the loop-freedom argument). Routes are added
-//! with the blocking `route_manager` API at listener startup and removed on
-//! drop; a failed add is a warning, not a fatal error, because the device
-//! subnet's own on-link route frequently already covers the range (in which
-//! case some platforms report "route exists").
+//! Fake-IP mode deliberately routes only the fake-IP range into the device
+//! (see the module docs in `mod.rs` for the loop-freedom argument). Global
+//! mode installs only owned split defaults into the device. Existing
+//! more-specific LAN routes are left untouched; outbound sockets bind to the
+//! physical interface for proxy and DIRECT egress. Routes are added with the
+//! blocking `route_manager` API at listener startup and removed on drop.
+
+use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::IpNet;
 use route_manager::{Route, RouteManager};
 use tracing::{debug, warn};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PhysicalEgress {
+    if_index: Option<u32>,
+    if_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedRoute {
+    net: IpNet,
+    if_index: u32,
+}
 
 pub(super) struct RouteGuard {
     manager: RouteManager,
@@ -22,22 +36,186 @@ impl RouteGuard {
     /// equivalent route does not abort listener startup.
     pub(super) fn setup(if_index: u32, nets: &[IpNet]) -> std::io::Result<Self> {
         let mut manager = RouteManager::new()?;
-        let mut installed = Vec::with_capacity(nets.len());
-        for net in nets {
-            let route = Route::new(net.network(), net.prefix_len()).with_if_index(if_index);
-            match manager.add(&route) {
-                Ok(()) => {
-                    debug!("tun auto-route: added {net} via if_index {if_index}");
-                    installed.push(route);
-                }
-                Err(e) => warn!(
-                    "tun auto-route: failed to add {net} via if_index {if_index}: {e} \
-                     (continuing — the device subnet may already cover it)"
-                ),
-            }
-        }
+        let plan = fake_ip_route_plan(if_index, nets);
+        let installed = add_best_effort(&mut manager, &plan);
         Ok(Self { manager, installed })
     }
+
+    /// Install global-capture routes and fail closed on any add failure.
+    /// Already-added routes are removed before returning the error, so a
+    /// startup failure cannot leave half of the split default active.
+    pub(super) fn setup_global(if_index: u32) -> std::io::Result<Self> {
+        let mut manager = RouteManager::new()?;
+        let plan = global_route_plan(if_index);
+        let installed = add_required_with_rollback(&mut manager, &plan)?;
+        Ok(Self { manager, installed })
+    }
+}
+
+trait RouteBackend {
+    fn add_route(&mut self, route: &Route) -> std::io::Result<()>;
+    fn delete_route(&mut self, route: &Route) -> std::io::Result<()>;
+}
+
+impl RouteBackend for RouteManager {
+    fn add_route(&mut self, route: &Route) -> std::io::Result<()> {
+        self.add(route)
+    }
+
+    fn delete_route(&mut self, route: &Route) -> std::io::Result<()> {
+        self.delete(route)
+    }
+}
+
+fn add_best_effort(manager: &mut impl RouteBackend, plan: &[PlannedRoute]) -> Vec<Route> {
+    let mut installed = Vec::with_capacity(plan.len());
+    for planned in plan {
+        let route = planned.to_route();
+        match manager.add_route(&route) {
+            Ok(()) => {
+                debug!("tun auto-route: added {}", planned.describe());
+                installed.push(route);
+            }
+            Err(e) => warn!(
+                "tun auto-route: failed to add {}: {e} (continuing — the device subnet may \
+                 already cover it)",
+                planned.describe()
+            ),
+        }
+    }
+    installed
+}
+
+fn add_required_with_rollback(
+    manager: &mut impl RouteBackend,
+    plan: &[PlannedRoute],
+) -> std::io::Result<Vec<Route>> {
+    let mut installed = Vec::with_capacity(plan.len());
+    for planned in plan {
+        let route = planned.to_route();
+        match manager.add_route(&route) {
+            Ok(()) => {
+                debug!("tun auto-route: added {}", planned.describe());
+                installed.push(route);
+            }
+            Err(e) => {
+                for route in installed.iter().rev() {
+                    if let Err(delete_err) = manager.delete_route(route) {
+                        warn!("tun auto-route: rollback failed to remove {route}: {delete_err}");
+                    }
+                }
+                return Err(std::io::Error::other(format!(
+                    "failed to add {}: {e}",
+                    planned.describe()
+                )));
+            }
+        }
+    }
+    Ok(installed)
+}
+
+impl PlannedRoute {
+    fn to_route(&self) -> Route {
+        let mut route = Route::new(self.net.network(), self.net.prefix_len());
+        route = route.with_if_index(self.if_index);
+        route
+    }
+
+    fn describe(&self) -> String {
+        format!("{} via tun if_index {}", self.net, self.if_index)
+    }
+}
+
+fn fake_ip_route_plan(if_index: u32, nets: &[IpNet]) -> Vec<PlannedRoute> {
+    nets.iter()
+        .copied()
+        .map(|net| PlannedRoute { net, if_index })
+        .collect()
+}
+
+fn global_route_plan(if_index: u32) -> Vec<PlannedRoute> {
+    vec![
+        PlannedRoute {
+            net: cidr("0.0.0.0/1"),
+            if_index,
+        },
+        PlannedRoute {
+            net: cidr("128.0.0.0/1"),
+            if_index,
+        },
+    ]
+}
+
+fn cidr(net: &str) -> IpNet {
+    net.parse().expect("static CIDR parses")
+}
+
+pub(super) fn default_egress() -> std::io::Result<PhysicalEgress> {
+    let mut manager = RouteManager::new()?;
+    let route = manager
+        .find_route(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))?
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no IPv4 default route found")
+        })?;
+
+    Ok(PhysicalEgress {
+        if_index: route.if_index(),
+        if_name: route.if_name().cloned(),
+    })
+}
+
+/// Pick a usable interface identifier for the outbound-socket binding hook.
+/// Prefer the configured value, otherwise use the default egress name when
+/// available and fall back to the interface index. Linux resolves that index
+/// to a name because SO_BINDTODEVICE takes a name rather than an index.
+pub(super) fn outbound_interface_name(
+    configured: Option<String>,
+    physical: Option<&PhysicalEgress>,
+) -> std::io::Result<String> {
+    if let Some(name) = configured.filter(|s| !s.is_empty()) {
+        return Ok(name);
+    }
+    let physical = physical.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no configured outbound interface and no default egress was discovered",
+        )
+    })?;
+    if let Some(name) = &physical.if_name {
+        return Ok(name.clone());
+    }
+    if let Some(index) = physical.if_index {
+        #[cfg(target_os = "linux")]
+        {
+            return linux_if_index_to_name(index);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Ok(index.to_string());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "default route did not include an interface name or index",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_if_index_to_name(index: u32) -> std::io::Result<String> {
+    let mut ifname = [0 as libc::c_char; libc::IF_NAMESIZE];
+    let ptr = unsafe { libc::if_indextoname(index, ifname.as_mut_ptr()) };
+    if ptr.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe { std::ffi::CStr::from_ptr(ifname.as_ptr()) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("interface index {index} resolved to non-UTF-8 name"),
+            )
+        })
 }
 
 impl Drop for RouteGuard {
@@ -50,75 +228,125 @@ impl Drop for RouteGuard {
     }
 }
 
-/// Detect the physical interface carrying the IPv4 default route, for
-/// global route scope's outbound-socket binding (#375). Linux-only for now:
-/// reads `/proc/net/route` and returns the interface of the first UP
-/// `0.0.0.0/0` entry — captured **before** the TUN's own split defaults go
-/// in, so the TUN device can never be the answer.
-pub(super) fn default_interface() -> std::io::Result<String> {
-    #[cfg(target_os = "linux")]
-    {
-        let table = std::fs::read_to_string("/proc/net/route")?;
-        parse_default_interface(&table).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no IPv4 default route found in /proc/net/route",
-            )
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "default-interface auto-detection is Linux-only (tracked on #375)",
-        ))
-    }
-}
-
-/// Pure parser behind [`default_interface`], split out for unit testing on
-/// every host (hence `test` in the cfg — only Linux uses it at runtime).
-/// `/proc/net/route` columns: Iface, Destination (hex LE),
-/// Gateway, Flags (hex; bit 0 = RTF_UP), … A default route has destination
-/// `00000000` and the UP flag set.
-#[cfg(any(target_os = "linux", test))]
-fn parse_default_interface(table: &str) -> Option<String> {
-    for line in table.lines().skip(1) {
-        let mut cols = line.split_whitespace();
-        let (Some(iface), Some(dest), _gateway, Some(flags)) =
-            (cols.next(), cols.next(), cols.next(), cols.next())
-        else {
-            continue;
-        };
-        let up = u32::from_str_radix(flags, 16).is_ok_and(|f| f & 0x1 != 0);
-        if dest == "00000000" && up {
-            return Some(iface.to_string());
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_default_interface;
-
-    const SAMPLE: &str = "\
-Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
-docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
-eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
-eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
-";
+    use super::*;
+    use ipnet::Ipv4Net;
 
     #[test]
-    fn picks_the_up_default_route_interface() {
-        assert_eq!(parse_default_interface(SAMPLE).as_deref(), Some("eth0"));
+    fn global_route_plan_only_owns_split_defaults() {
+        let plan = global_route_plan(42);
+        let nets: Vec<String> = plan.iter().map(|p| p.net.to_string()).collect();
+        assert_eq!(nets, vec!["0.0.0.0/1", "128.0.0.0/1"]);
+        assert!(plan.iter().all(|p| p.if_index == 42));
     }
 
     #[test]
-    fn ignores_down_defaults_and_empty_tables() {
-        // Same default entry but with the UP bit clear → not a candidate.
-        let down = SAMPLE.replace("00000000\t0101A8C0\t0003", "00000000\t0101A8C0\t0002");
-        assert_eq!(parse_default_interface(&down), None);
-        assert_eq!(parse_default_interface("Iface\tDestination\n"), None);
-        assert_eq!(parse_default_interface(""), None);
+    fn fake_ip_route_plan_only_routes_requested_nets() {
+        let nets = vec![IpNet::V4(
+            Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 16).unwrap(),
+        )];
+        let plan = fake_ip_route_plan(9, &nets);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].net.to_string(), "198.18.0.0/16");
+        assert_eq!(plan[0].if_index, 9);
+    }
+
+    #[derive(Default)]
+    struct FakeBackend {
+        fail_add_at: Option<usize>,
+        adds: Vec<Route>,
+        deletes: Vec<Route>,
+    }
+
+    impl RouteBackend for FakeBackend {
+        fn add_route(&mut self, route: &Route) -> std::io::Result<()> {
+            if self.fail_add_at == Some(self.adds.len()) {
+                return Err(std::io::Error::other("injected add failure"));
+            }
+            self.adds.push(route.clone());
+            Ok(())
+        }
+
+        fn delete_route(&mut self, route: &Route) -> std::io::Result<()> {
+            self.deletes.push(route.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn required_setup_rolls_back_on_add_failure() {
+        let plan = global_route_plan(42);
+        let mut backend = FakeBackend {
+            fail_add_at: Some(1),
+            ..Default::default()
+        };
+        let err = add_required_with_rollback(&mut backend, &plan).unwrap_err();
+        assert!(err.to_string().contains("128.0.0.0/1"), "{err}");
+        assert_eq!(backend.adds.len(), 1);
+        assert_eq!(
+            backend.deletes,
+            backend.adds.iter().rev().cloned().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn best_effort_setup_keeps_successful_routes() {
+        let plan = fake_ip_route_plan(
+            9,
+            &[
+                IpNet::V4(Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 16).unwrap()),
+                IpNet::V4(Ipv4Net::new(Ipv4Addr::new(203, 0, 113, 0), 24).unwrap()),
+            ],
+        );
+        let mut backend = FakeBackend {
+            fail_add_at: Some(1),
+            ..Default::default()
+        };
+        let installed = add_best_effort(&mut backend, &plan);
+        assert_eq!(installed.len(), 1);
+        assert_eq!(backend.deletes.len(), 0);
+    }
+
+    #[test]
+    fn outbound_interface_uses_config_then_default_name_then_index() {
+        let physical = PhysicalEgress {
+            if_index: Some(7),
+            if_name: Some("en0".into()),
+        };
+        assert_eq!(
+            outbound_interface_name(Some("Ethernet".into()), None).unwrap(),
+            "Ethernet"
+        );
+        assert_eq!(
+            outbound_interface_name(None, Some(&physical)).unwrap(),
+            "en0"
+        );
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let physical = PhysicalEgress {
+                if_index: Some(7),
+                if_name: None,
+            };
+            assert_eq!(outbound_interface_name(None, Some(&physical)).unwrap(), "7");
+        }
+        assert!(outbound_interface_name(None, None).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_outbound_interface_resolves_index_to_name() {
+        let lo = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        assert_ne!(lo, 0, "lo must exist");
+        let physical = PhysicalEgress {
+            if_index: Some(lo),
+            if_name: None,
+        };
+        assert_eq!(
+            outbound_interface_name(None, Some(&physical)).unwrap(),
+            "lo"
+        );
+        assert!(linux_if_index_to_name(0).is_err());
     }
 }

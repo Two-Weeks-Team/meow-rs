@@ -31,15 +31,16 @@
 //!
 //! The trade-off: IP-literal traffic (no DNS lookup) is not captured.
 //!
-//! ## Global route scope (#375, experimental, Linux-only)
+//! ## Global route scope (#375, experimental)
 //!
 //! [`TunRouteScope::Global`] opts into capturing everything: `auto-route`
 //! installs split default routes (`0.0.0.0/1` + `128.0.0.0/1`), and loop
 //! freedom moves from route scoping to the outbound path — every socket
 //! meow creates is bound to the physical interface
-//! (`meow_common::set_outbound_interface`, `SO_BINDTODEVICE`) before
-//! connect/bind, and hostname dials resolve through meow's own resolver
-//! hook. Startup fails closed if the binding cannot be installed.
+//! (`meow_common::set_outbound_interface`) before connect/bind, and hostname
+//! dials resolve through meow's own resolver hook. Startup fails closed if
+//! the binding cannot be installed. Existing more-specific LAN routes are
+//! preserved; this module only owns and cleans up the split defaults it adds.
 //!
 //! On Windows the device is a Wintun adapter. `wintun.dll` is resolved next
 //! to the executable (official Windows zips ship it there), then the working
@@ -140,7 +141,8 @@ pub struct TunListenerConfig {
     /// Scope of the installed routes (#375).
     pub route_scope: TunRouteScope,
     /// Physical interface outbound sockets bind to in global scope; `None`
-    /// = auto-detect from the default route. Ignored in fake-IP scope.
+    /// = auto-detect from the default route captured before split defaults
+    /// are installed. Ignored in fake-IP scope.
     pub outbound_interface: Option<String>,
     /// Answer UDP :53 flows with the in-process DNS resolver.
     pub dns_hijack: bool,
@@ -158,8 +160,7 @@ pub enum TunRouteScope {
     #[default]
     FakeIp,
     /// Route all IPv4 (split defaults `0.0.0.0/1` + `128.0.0.0/1`) into the
-    /// device; outbound sockets bind to the physical interface for loop
-    /// avoidance. Experimental, Linux-only.
+    /// device; outbound sockets bind to the physical interface for loop avoidance.
     Global,
 }
 
@@ -220,22 +221,25 @@ impl Drop for ReadyNotifier {
     }
 }
 
-/// Wraps [`tun_rs::AsyncDevice`] together with its [`RouteGuard`] in a
-/// single `Arc` so they share one reference-counted lifetime. Field
-/// declaration order guarantees `route_guard` is dropped (routes deleted)
-/// **before** `device` (adapter destroyed) when the last `Arc` clone goes
-/// away — ensuring route deletion always succeeds because the adapter is
-/// still alive.
+/// Wraps [`tun_rs::AsyncDevice`] together with auto-route state in a single
+/// `Arc` so they share one reference-counted lifetime. Field declaration
+/// order drops `auto_route_guard` before `device`, so route cleanup runs while
+/// the adapter still exists.
 struct TunDevice {
-    /// Held only for its `Drop` side effect — routes are deleted when
-    /// this field is dropped, before `device` is destroyed.
+    #[allow(dead_code)]
+    auto_route_guard: Option<AutoRouteGuard>,
+    pub(super) device: tun_rs::AsyncDevice,
+}
+
+/// Holds route ownership and outbound-interface binding as one startup result.
+/// Field order drops routes before clearing the binding. If startup fails after
+/// binding but before route installation completes, this guard rolls back the
+/// binding inside the same blocking task.
+struct AutoRouteGuard {
     #[allow(dead_code)]
     route_guard: Option<RouteGuard>,
-    /// Held only for its `Drop` side effect — clears the process-global
-    /// outbound-interface binding installed for global route scope.
     #[allow(dead_code)]
     iface_guard: Option<OutboundIfaceGuard>,
-    pub(super) device: tun_rs::AsyncDevice,
 }
 
 /// RAII wrapper for `meow_common::set_outbound_interface`: global route
@@ -244,10 +248,56 @@ struct TunDevice {
 /// interface.
 struct OutboundIfaceGuard;
 
+impl OutboundIfaceGuard {
+    fn install(iface: &str) -> io::Result<Self> {
+        meow_common::set_outbound_interface(iface)?;
+        Ok(Self)
+    }
+}
+
 impl Drop for OutboundIfaceGuard {
     fn drop(&mut self) {
         meow_common::clear_outbound_interface();
     }
+}
+
+fn setup_global_auto_route(
+    if_index: u32,
+    configured_iface: Option<String>,
+    listener_name: &str,
+) -> io::Result<AutoRouteGuard> {
+    let physical_egress = if configured_iface.as_ref().is_some_and(|s| !s.is_empty()) {
+        None
+    } else {
+        Some(route::default_egress().map_err(|e| {
+            io::Error::other(format!(
+                "tun auto-route: global: could not capture the physical egress ({e})"
+            ))
+        })?)
+    };
+    let iface = route::outbound_interface_name(configured_iface, physical_egress.as_ref())
+        .map_err(|e| {
+            io::Error::other(format!(
+                "tun auto-route: global: could not select the physical interface \
+                 ({e}); set tun.outbound-interface explicitly"
+            ))
+        })?;
+    let iface_guard = OutboundIfaceGuard::install(&iface).map_err(|e| {
+        io::Error::other(format!(
+            "tun auto-route: global: outbound interface binding failed ({e}); \
+             refusing to install default routes without loop avoidance"
+        ))
+    })?;
+    let route_guard = RouteGuard::setup_global(if_index)?;
+    info!(
+        "tun '{}': global route scope — outbound sockets bound to '{iface}' \
+         (experimental, #375)",
+        listener_name
+    );
+    Ok(AutoRouteGuard {
+        route_guard: Some(route_guard),
+        iface_guard: Some(iface_guard),
+    })
 }
 
 pub struct TunListener {
@@ -417,79 +467,34 @@ impl TunListener {
         // Obtain the interface index before moving `device` into `TunDevice`.
         let if_index = device.if_index()?;
 
-        // Global route scope (#375): before any routes go in, install the
-        // outbound-interface binding so meow's own dials cannot loop back
-        // into the device. Fail closed — a global default route without
-        // working loop avoidance would blackhole the host's connectivity.
-        let iface_guard = if cfg.auto_route && cfg.route_scope == TunRouteScope::Global {
-            if !cfg!(target_os = "linux") {
-                return Err(Box::new(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "tun auto-route: global is currently Linux-only (tracked on #375); \
-                     use auto-route: fake-ip on this platform",
-                )));
-            }
-            let iface = match cfg.outbound_interface.clone() {
-                Some(name) => name,
-                None => route::default_interface().map_err(|e| {
-                    io::Error::other(format!(
-                        "tun auto-route: global: could not auto-detect the physical \
-                         interface ({e}); set tun.outbound-interface explicitly"
-                    ))
-                })?,
-            };
-            meow_common::set_outbound_interface(&iface).map_err(|e| {
-                io::Error::other(format!(
-                    "tun auto-route: global: outbound interface binding failed ({e}); \
-                     refusing to install default routes without loop avoidance"
-                ))
-            })?;
-            info!(
-                "tun '{}': global route scope — outbound sockets bound to '{iface}' \
-                 (experimental, #375)",
-                self.name
-            );
-            Some(OutboundIfaceGuard)
-        } else {
-            None
-        };
-
         // auto-route: install the scope's routes (see module docs).
         //
-        // RouteManager::add() calls into OS routing APIs that may block
-        // (PowerShell on Windows), so it runs on a blocking thread. The
-        // outer TUN_STARTUP_TIMEOUT guards the overall startup.
-        let route_nets: Option<Vec<ipnet::IpNet>> = if cfg.auto_route {
+        // RouteManager::add() and default-route discovery call into OS routing
+        // APIs that may block (PowerShell on Windows), so they run on a
+        // blocking thread. The device is moved into that thread and returned
+        // with the guard so cancellation cannot destroy the adapter or clear
+        // the outbound binding while route setup is still running.
+        let device = if cfg.auto_route {
             match cfg.route_scope {
-                // Split defaults: two /1s cover all IPv4 while staying more
-                // specific than the physical 0/0 default, so the original
-                // route survives untouched and restore-on-drop is trivial.
-                // The device's own /30 and the fake-IP range (if any) are
-                // inside the /1s already.
-                TunRouteScope::Global => Some(vec![
-                    "0.0.0.0/1".parse().expect("static CIDR parses"),
-                    "128.0.0.0/1".parse().expect("static CIDR parses"),
-                ]),
-                TunRouteScope::FakeIp => self.tunnel.resolver().fake_ip_v4_net().map(|n| vec![n]),
-            }
-        } else {
-            None
-        };
-
-        let route_guard = if cfg.auto_route {
-            match route_nets {
-                Some(nets) => {
+                TunRouteScope::Global => {
                     let t_route = Instant::now();
-
-                    let result =
-                        tokio::task::spawn_blocking(move || RouteGuard::setup(if_index, &nets))
-                            .await;
+                    let configured_iface = cfg.outbound_interface.clone();
+                    let listener_name = self.name.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let guard =
+                            setup_global_auto_route(if_index, configured_iface, &listener_name)?;
+                        Ok::<_, io::Error>(TunDevice {
+                            auto_route_guard: Some(guard),
+                            device,
+                        })
+                    })
+                    .await;
 
                     match result {
-                        Ok(Ok(g)) => {
+                        Ok(Ok(result)) => {
                             let route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
                             info!("auto-route installed in {route_ms:.0}ms");
-                            Some(g)
+                            result
                         }
                         Ok(Err(e)) => {
                             return Err(Box::new(io::Error::other(format!(
@@ -503,31 +508,66 @@ impl TunListener {
                         }
                     }
                 }
-                None => {
-                    warn!(
-                        "tun '{}': auto-route currently only routes the fake-IP range, but \
-                         DNS is not in fake-ip mode — no routes installed. Add routes to \
-                         '{dev_name}' manually (and make sure outbound traffic cannot loop \
-                         back into the device).",
-                        self.name
-                    );
-                    None
+                TunRouteScope::FakeIp => {
+                    match self.tunnel.resolver().fake_ip_v4_net().map(|n| vec![n]) {
+                        Some(nets) => {
+                            let t_route = Instant::now();
+                            let result = tokio::task::spawn_blocking(move || {
+                                let route_guard = RouteGuard::setup(if_index, &nets)?;
+                                Ok::<_, io::Error>(TunDevice {
+                                    auto_route_guard: Some(AutoRouteGuard {
+                                        route_guard: Some(route_guard),
+                                        iface_guard: None,
+                                    }),
+                                    device,
+                                })
+                            })
+                            .await;
+
+                            match result {
+                                Ok(Ok(result)) => {
+                                    let route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
+                                    info!("auto-route installed in {route_ms:.0}ms");
+                                    result
+                                }
+                                Ok(Err(e)) => {
+                                    return Err(Box::new(io::Error::other(format!(
+                                        "failed to install auto-route: {e}"
+                                    ))));
+                                }
+                                Err(join_err) => {
+                                    return Err(Box::new(io::Error::other(format!(
+                                        "auto-route spawn_blocking panicked: {join_err}"
+                                    ))));
+                                }
+                            }
+                        }
+                        None => {
+                            warn!(
+                                "tun '{}': auto-route is in fake-ip scope, but DNS is not in \
+                                 fake-ip mode — no routes installed. Add routes to '{dev_name}' \
+                                 manually (and make sure outbound traffic cannot loop back into \
+                                 the device).",
+                                self.name
+                            );
+                            TunDevice {
+                                auto_route_guard: None,
+                                device,
+                            }
+                        }
+                    }
                 }
             }
         } else {
-            None
+            TunDevice {
+                auto_route_guard: None,
+                device,
+            }
         };
 
-        // Wrap the device and its route guard in a single `Arc` so they share
-        // one reference-counted lifetime. Field order guarantees `route_guard`
-        // is dropped (routes deleted) **before** `device` (adapter destroyed)
-        // when the last `Arc` clone goes away — ensuring route deletion always
-        // succeeds because the adapter is still alive.
-        let device = Arc::new(TunDevice {
-            route_guard,
-            iface_guard,
-            device,
-        });
+        // Wrap the device and its auto-route guard in a single `Arc` so they
+        // share one reference-counted lifetime.
+        let device = Arc::new(device);
 
         // Windows: bind the loopback DNS sockets *before* DnsGuard repoints
         // the OS resolver at them. If port 53 is already taken (ICS, Docker,

@@ -179,7 +179,7 @@ pub enum TunRouteMode {
     FakeIp,
     /// Route all IPv4 traffic into the device (split default routes) and
     /// bind outbound sockets to the physical interface for loop avoidance.
-    /// Experimental; currently Linux-only.
+    /// Experimental; supported where the TUN listener has route/bind backends.
     Global,
 }
 

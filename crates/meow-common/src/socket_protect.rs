@@ -311,7 +311,7 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     // TUN global-route loop avoidance (#375): when an outbound interface is
     // installed, bind the socket to it before connect() so the SYN already
     // takes the physical route past the TUN default routes.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
         if crate::outbound_iface::outbound_interface().is_some() {
             return connect_tcp_iface_bound(addr).await;
@@ -321,9 +321,9 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
 }
 
 /// Dial with the socket bound to the installed outbound interface
-/// (`SO_BINDTODEVICE`) before `connect()`. Uses `tokio::net::TcpSocket` for
-/// the async connect so connection errors surface here, not on first I/O.
-#[cfg(target_os = "linux")]
+/// before `connect()`. Uses `tokio::net::TcpSocket` for the async connect so
+/// connection errors surface here, not on first I/O.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
@@ -496,7 +496,7 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
     // TUN global-route loop avoidance (#375): bind the socket to the
     // installed outbound interface before the local-address bind, mirroring
     // `connect_tcp` — so the first datagram already bypasses the TUN routes.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
         if crate::outbound_iface::outbound_interface().is_some() {
             let resolved = tokio::net::lookup_host(local)
@@ -511,9 +511,8 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
     UdpSocket::bind(local).await
 }
 
-/// Bind a UDP socket to the installed outbound interface
-/// (`SO_BINDTODEVICE`), then to `local`.
-#[cfg(target_os = "linux")]
+/// Bind a UDP socket to the installed outbound interface, then to `local`.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn bind_udp_iface_bound(local: SocketAddr) -> io::Result<UdpSocket> {
     let domain = if local.is_ipv4() {
         socket2::Domain::IPV4
