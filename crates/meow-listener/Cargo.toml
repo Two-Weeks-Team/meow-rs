@@ -42,6 +42,15 @@ route_manager = { workspace = true, optional = true }
 meow-dns = { workspace = true, optional = true }
 ipnet = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Reuse the Windows bindings already used by meow-app and tun-rs.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Security",
+    "Win32_System_Rpc",
+] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 meow-dns = { workspace = true }
