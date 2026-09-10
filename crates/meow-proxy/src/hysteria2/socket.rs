@@ -43,7 +43,7 @@ impl Hy2UdpSocket {
         } else {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         };
-        let std_sock = std::net::UdpSocket::bind(bind_addr).map_err(Error::Io)?;
+        let std_sock = bind_protected_std_udp(bind_addr).await?;
         let runtime = quinn::TokioRuntime;
         let inner = runtime.wrap_udp_socket(std_sock)?;
         Ok(Arc::new(Self {
@@ -85,6 +85,11 @@ impl Hy2UdpSocket {
         source.set_port(self.server_addr.port());
         source
     }
+}
+
+pub(super) async fn bind_protected_std_udp(bind_addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    let socket = meow_common::bind_udp(bind_addr).await.map_err(Error::Io)?;
+    socket.into_std().map_err(Error::Io)
 }
 
 impl AsyncUdpSocket for Hy2UdpSocket {
@@ -434,5 +439,106 @@ mod tests {
         assert!(ports.contains(8443));
         assert!(ports.contains(8445));
         assert!(!ports.contains(8446));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn custom_socket_binds_and_wraps_udp_socket() {
+        let server_addr = "127.0.0.1:443".parse().unwrap();
+
+        let socket = Hy2UdpSocket::bind(server_addr, "8443", 5, 5, "secret")
+            .await
+            .expect("HY2 custom socket should bind and wrap a UDP socket");
+
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+    }
+}
+
+#[cfg(all(test, target_os = "android"))]
+pub(in crate::hysteria2) mod android_protector_tests {
+    use meow_common::{clear_socket_protector, set_socket_protector, SocketProtector};
+    use std::io;
+    use std::os::fd::RawFd;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    };
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    pub(in crate::hysteria2) struct ProtectorGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ProtectorGuard {
+        fn drop(&mut self) {
+            clear_socket_protector();
+        }
+    }
+
+    pub(in crate::hysteria2) struct SpyProtector {
+        calls: AtomicUsize,
+        fail: bool,
+    }
+
+    impl SpyProtector {
+        pub(in crate::hysteria2) fn install(fail: bool) -> (Arc<Self>, ProtectorGuard) {
+            let guard = LOCK
+                .lock()
+                .expect("HY2 Android protector test lock poisoned");
+            clear_socket_protector();
+            let protector = Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                fail,
+            });
+            set_socket_protector(Arc::clone(&protector) as Arc<dyn SocketProtector>);
+            (protector, ProtectorGuard { _guard: guard })
+        }
+
+        pub(in crate::hysteria2) fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SocketProtector for SpyProtector {
+        fn protect(&self, fd: RawFd) -> io::Result<()> {
+            assert!(fd >= 0, "protector must receive an open fd");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(io::Error::other("android protect denied"));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "android"))]
+mod android_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn custom_socket_invokes_android_protector() {
+        let (protector, _guard) = android_protector_tests::SpyProtector::install(false);
+        let server_addr = "127.0.0.1:443".parse().unwrap();
+
+        let socket = Hy2UdpSocket::bind(server_addr, "8443", 5, 5, "secret")
+            .await
+            .expect("protected custom HY2 socket bind should succeed");
+
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+        assert_eq!(protector.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_socket_propagates_android_protector_rejection() {
+        let (protector, _guard) = android_protector_tests::SpyProtector::install(true);
+        let server_addr = "127.0.0.1:443".parse().unwrap();
+
+        let err = Hy2UdpSocket::bind(server_addr, "8443", 5, 5, "secret")
+            .await
+            .expect_err("protector rejection should stop custom HY2 socket setup");
+
+        assert!(err.to_string().contains("android protect denied"));
+        assert_eq!(protector.calls(), 1);
     }
 }

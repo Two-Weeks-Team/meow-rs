@@ -1,5 +1,5 @@
 use super::config::Config;
-use super::socket::Hy2UdpSocket;
+use super::socket::{bind_protected_std_udp, Hy2UdpSocket};
 use super::tcp::{self, DuplexStream};
 use super::tls;
 use super::udp::{self, UdpRouter, UdpSession};
@@ -147,7 +147,7 @@ async fn connect_addr(
         } else {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         };
-        let std_sock = std::net::UdpSocket::bind(bind_addr).map_err(Error::Io)?;
+        let std_sock = bind_protected_std_udp(bind_addr).await?;
         let runtime = Arc::new(quinn::TokioRuntime);
         let socket = runtime.wrap_udp_socket(std_sock)?;
         let mut endpoint_cfg = quinn::EndpointConfig::default();
@@ -307,5 +307,32 @@ mod tests {
         let target = ServerTarget::parse("[::1]:443").unwrap();
         assert_eq!(target.host, "::1");
         assert_eq!(target.port, 443);
+    }
+}
+
+#[cfg(all(test, target_os = "android"))]
+mod android_tests {
+    use super::*;
+    use crate::hysteria2::socket::android_protector_tests;
+
+    #[tokio::test]
+    async fn plain_endpoint_propagates_android_protector_rejection_before_connect() {
+        let (protector, _guard) = android_protector_tests::SpyProtector::install(true);
+        let cfg = Arc::new(Config {
+            server_addr: "127.0.0.1:443".into(),
+            server_name: "localhost".into(),
+            auth: "secret".into(),
+            insecure: true,
+            ..Default::default()
+        });
+        let server_addr = "127.0.0.1:443".parse().unwrap();
+
+        let err = match connect_addr(cfg, server_addr, "localhost").await {
+            Ok(_) => panic!("protector rejection should stop plain HY2 endpoint setup"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("android protect denied"));
+        assert_eq!(protector.calls(), 1);
     }
 }
