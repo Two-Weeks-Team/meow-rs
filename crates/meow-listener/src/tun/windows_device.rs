@@ -312,6 +312,35 @@ mod tests {
                 before
             );
         }
+
+        // The listener can retry a rejected name without reusing or deleting
+        // its occupant. Use a separate address so this checks name ownership
+        // independently of the listener's later address-conflict retries.
+        let replacement = create_owned(
+            &format!("{name}-1"),
+            dll,
+            1300,
+            Ipv4Addr::new(192, 0, 2, 2),
+            32,
+        )
+        .expect("a rejected name must not prevent acquiring a different fresh adapter");
+        assert_ne!(
+            replacement.if_index().unwrap(),
+            existing.if_index().unwrap()
+        );
+        assert_eq!(replacement.mtu().unwrap(), 1300);
+        assert!(ipv4_addresses(&replacement).contains(&Ipv4Addr::new(192, 0, 2, 2).into()));
+        assert_eq!(
+            (
+                existing.mtu().unwrap(),
+                existing.mtu_v6().unwrap(),
+                ipv4_addresses(&existing),
+                ipv4_interface(existing.if_luid().unwrap())
+                    .unwrap()
+                    .DadTransmits,
+            ),
+            before
+        );
     }
 
     #[test]

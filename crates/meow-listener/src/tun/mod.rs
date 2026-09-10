@@ -384,8 +384,9 @@ impl TunListener {
         };
 
         // Try up to 5 device names and IPs in case the previous instance
-        // left a device that hasn't been cleaned up yet. Windows ownership
-        // collisions fail immediately; only other creation errors retry.
+        // left a device that hasn't been cleaned up yet. On Windows, a name
+        // collision leaves that interface untouched; the next attempt uses
+        // another name and must independently prove a fresh adapter GUID.
         // After the first retry fails, we also rotate the TUN IP to work
         // around address conflicts.
         //
@@ -461,12 +462,6 @@ impl TunListener {
                     break;
                 }
                 Ok(Err(e)) => {
-                    // An ownership conflict is not a stale-device retry:
-                    // leave the existing interface untouched and fail startup.
-                    #[cfg(target_os = "windows")]
-                    if e.kind() == io::ErrorKind::AlreadyExists {
-                        return Err(Box::new(e));
-                    }
                     warn!("failed to create TUN device '{}': {e}", display_name);
                     last_err = Some(e.to_string());
                 }
@@ -804,7 +799,7 @@ impl TunListener {
 /// given, so never invent a name there — pass the configured name through
 /// unchanged (suffix rotation would produce an invalid `utunN-1`). Elsewhere
 /// default to "meow-tun" and rotate a numeric suffix for creation retries.
-/// Windows ownership collisions are rejected before a retry is attempted.
+/// On Windows each name is acquired with a fresh, verified adapter GUID.
 fn device_name_for_attempt(configured: Option<&str>, attempt: u32) -> Option<String> {
     if cfg!(target_os = "macos") {
         configured.map(str::to_string)
