@@ -347,11 +347,13 @@ impl AsyncRead for RealityTlsStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if self.read_raw_passthrough {
-            return Pin::new(&mut self.inner).poll_read(cx, buf);
-        }
+        // Vision can switch to DIRECT while this record still has unread
+        // plaintext. Preserve its order ahead of subsequent raw socket bytes.
         if self.drain_read_plain(buf) {
             return Poll::Ready(Ok(()));
+        }
+        if self.read_raw_passthrough {
+            return Pin::new(&mut self.inner).poll_read(cx, buf);
         }
 
         loop {
@@ -1592,6 +1594,52 @@ mod tests {
     }
 
     // ─── Split + concurrent direction polling (mux regression) ───────────────
+
+    #[tokio::test]
+    async fn direct_read_preserves_buffered_plaintext_before_raw_bytes() {
+        let (client_io, mut peer) = tokio::io::duplex(32);
+        let secret = [0x61; 32];
+        let mut sender = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let record = sender
+            .seal(TLS_RECORD_APPLICATION_DATA, b"boundarybuffered")
+            .unwrap();
+        let writer = tokio::spawn(async move {
+            peer.write_all(&record).await.unwrap();
+            peer.write_all(b"raw").await.unwrap();
+            peer.shutdown().await.unwrap();
+        });
+        let mut stream = RealityTlsStream {
+            inner: Box::new(client_io),
+            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            read_raw_passthrough: false,
+            write_raw_passthrough: false,
+            read_plain: VecDeque::new(),
+            read_state: StreamReadState::Header {
+                buf: [0; 5],
+                pos: 0,
+            },
+            write_pending: None,
+        };
+        let mut boundary = [0; 8];
+        stream.read_exact(&mut boundary).await.unwrap();
+        assert_eq!(&boundary, b"boundary");
+        stream.enable_raw_read_passthrough();
+
+        // A small caller buffer drains the decrypted tail across several reads;
+        // the small duplex capacity also splits the encrypted record at Pending.
+        let mut received = Vec::new();
+        let mut buf = [0; 2];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+        }
+        writer.await.unwrap();
+        assert_eq!(received, b"bufferedraw");
+    }
 
     /// Deterministic chunk bytes for a (seq, len) pair.
     fn chunk(seq: u32, len: usize) -> Vec<u8> {
