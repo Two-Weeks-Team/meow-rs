@@ -12,8 +12,11 @@ use std::ptr;
 use windows_sys::core::GUID;
 use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    ConvertInterfaceLuidToGuid, FreeMibTable, GetIfTable2, MIB_IF_TABLE2,
+    ConvertInterfaceLuidToGuid, FreeMibTable, GetIfTable2, GetIpInterfaceEntry,
+    SetIpInterfaceEntry, MIB_IF_TABLE2, MIB_IPINTERFACE_ROW,
 };
+use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+use windows_sys::Win32::Networking::WinSock::AF_INET;
 use windows_sys::Win32::System::Rpc::{UuidCreate, RPC_S_UUID_LOCAL_ONLY};
 
 pub(super) fn create_owned(
@@ -31,9 +34,47 @@ pub(super) fn create_owned(
     // its creating handle, which removes only this newly created adapter.
     device.set_mtu(mtu)?;
     device.set_mtu_v6(mtu)?;
+    // This private L3 interface has no neighboring hosts to probe. Disable DAD
+    // before adding its address, otherwise Windows can expose an Up adapter
+    // whose tentative address still cannot serve the system DNS resolver.
+    let luid = device.if_luid()?;
+    let mut row = ipv4_interface(luid)?;
+    row.DadTransmits = 0;
+    // Required by SetIpInterfaceEntry for IPv4, including read-modify-write.
+    row.SitePrefixLength = 0;
+    // SAFETY: row is the current IPv4 entry for this verified fresh LUID.
+    let status = unsafe { SetIpInterfaceEntry(&mut row) };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "disable duplicate address detection on owned Wintun: {}",
+            io::Error::from_raw_os_error(status as i32)
+        )));
+    }
+    if ipv4_interface(luid)?.DadTransmits != 0 {
+        return Err(io::Error::other(
+            "owned Wintun duplicate address detection remained enabled",
+        ));
+    }
     device.set_network_address(addr, prefix, None)?;
     device.enabled(true)?;
     tun_rs::AsyncDevice::new(device)
+}
+
+fn ipv4_interface(luid: NET_LUID_LH) -> io::Result<MIB_IPINTERFACE_ROW> {
+    let mut row = MIB_IPINTERFACE_ROW {
+        Family: AF_INET,
+        InterfaceLuid: luid,
+        ..Default::default()
+    };
+    // SAFETY: row is a live, aligned entry keyed by address family and LUID.
+    let status = unsafe { GetIpInterfaceEntry(&mut row) };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "read owned Wintun IPv4 interface: {}",
+            io::Error::from_raw_os_error(status as i32)
+        )));
+    }
+    Ok(row)
 }
 
 fn acquire_unconfigured(
@@ -149,6 +190,12 @@ fn ensure_absent(name: &str, requested: u128) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        IpDadStatePreferred, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_INET,
+    };
 
     #[test]
     fn guid_round_trip_matches_tun_rs_requested_guid() {
@@ -167,6 +214,33 @@ mod tests {
         let name = format!("meow-owner-test-{:032x}", fresh_guid().unwrap());
         let device = create_owned(&name, dll.clone(), 1420, Ipv4Addr::new(192, 0, 2, 1), 32)
             .expect("create isolated test adapter (requires Administrator)");
+        // Query the exact address immediately, before slower enumeration could
+        // hide a tentative interval. No sleeps or retries may mask this check.
+        let mut address = MIB_UNICASTIPADDRESS_ROW {
+            InterfaceLuid: device.if_luid().unwrap(),
+            Address: SOCKADDR_INET {
+                Ipv4: SOCKADDR_IN {
+                    sin_family: AF_INET,
+                    sin_addr: IN_ADDR {
+                        S_un: IN_ADDR_0 {
+                            S_addr: u32::from_ne_bytes([192, 0, 2, 1]),
+                        },
+                    },
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        // SAFETY: address identifies this fixture's LUID and IPv4 address.
+        let status = unsafe { GetUnicastIpAddressEntry(&mut address) };
+        assert_eq!(status, 0, "read the fixture's exact IPv4 address");
+        assert_eq!(address.DadState, IpDadStatePreferred);
+        assert_eq!(
+            ipv4_interface(device.if_luid().unwrap())
+                .unwrap()
+                .DadTransmits,
+            0
+        );
         assert_eq!(device.mtu().unwrap(), 1420);
         assert_eq!(device.mtu_v6().unwrap(), 1420);
         assert!(ipv4_addresses(&device).contains(&Ipv4Addr::new(192, 0, 2, 1).into()));
@@ -184,14 +258,36 @@ mod tests {
         addresses
     }
 
+    fn enable_fixture_dad(device: &tun_rs::AsyncDevice) {
+        let luid = device.if_luid().unwrap();
+        let mut row = ipv4_interface(luid).unwrap();
+        // Use a nonzero sentinel so an attempted reuse that writes zero before
+        // checking ownership cannot pass the preservation assertions below.
+        row.DadTransmits = 2;
+        row.SitePrefixLength = 0;
+        // SAFETY: row belongs only to the isolated fixture created by this test.
+        assert_eq!(unsafe { SetIpInterfaceEntry(&mut row) }, 0);
+        assert_eq!(ipv4_interface(luid).unwrap().DadTransmits, 2);
+    }
+
+    #[test]
+    #[ignore = "requires Windows Administrator and MEOW_TEST_WINTUN_DLL; creates an isolated adapter"]
+    fn new_adapter_ipv4_is_immediately_preferred() {
+        let (_name, _dll, _device) = fixture();
+    }
+
     #[test]
     #[ignore = "requires Windows Administrator and MEOW_TEST_WINTUN_DLL; creates an isolated adapter"]
     fn existing_adapter_is_rejected_before_configuration() {
         let (name, dll, existing) = fixture();
+        enable_fixture_dad(&existing);
         let before = (
             existing.mtu().unwrap(),
             existing.mtu_v6().unwrap(),
             ipv4_addresses(&existing),
+            ipv4_interface(existing.if_luid().unwrap())
+                .unwrap()
+                .DadTransmits,
         );
         for collision in [name.clone(), name.to_uppercase()] {
             let error = create_owned(
@@ -209,6 +305,9 @@ mod tests {
                     existing.mtu().unwrap(),
                     existing.mtu_v6().unwrap(),
                     ipv4_addresses(&existing),
+                    ipv4_interface(existing.if_luid().unwrap())
+                        .unwrap()
+                        .DadTransmits,
                 ),
                 before
             );
@@ -219,10 +318,14 @@ mod tests {
     #[ignore = "requires Windows Administrator and MEOW_TEST_WINTUN_DLL; creates an isolated adapter"]
     fn adapter_appearing_after_preflight_is_rejected_before_configuration() {
         let (name, dll, existing) = fixture();
+        enable_fixture_dad(&existing);
         let before = (
             existing.mtu().unwrap(),
             existing.mtu_v6().unwrap(),
             ipv4_addresses(&existing),
+            ipv4_interface(existing.if_luid().unwrap())
+                .unwrap()
+                .DadTransmits,
         );
         // Exercise the acquisition seam directly as if another process created
         // this adapter after the initial inventory. tun-rs takes its Open path.
@@ -235,6 +338,9 @@ mod tests {
                 existing.mtu().unwrap(),
                 existing.mtu_v6().unwrap(),
                 ipv4_addresses(&existing),
+                ipv4_interface(existing.if_luid().unwrap())
+                    .unwrap()
+                    .DadTransmits,
             ),
             before
         );
