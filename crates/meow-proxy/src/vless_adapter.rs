@@ -46,6 +46,15 @@ pub enum VlessFlow {
     XtlsRprxVision,
 }
 
+/// UDP packet encoding for VLESS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VlessPacketEncoding {
+    /// Ordinary VLESS UDP (`command = 0x02`, `u16be + payload` datagrams).
+    Packet,
+    /// XUDP over VLESS CommandMux (`command = 0x03`, Mux.Cool frames).
+    Xudp,
+}
+
 // ─── Adapter ─────────────────────────────────────────────────────────────────
 
 /// VLESS outbound proxy adapter.
@@ -57,6 +66,7 @@ pub struct VlessAdapter {
     uuid_bytes: [u8; 16],
     flow: Option<VlessFlow>,
     udp: bool,
+    packet_encoding: VlessPacketEncoding,
     transport: Arc<TransportChain>,
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
@@ -91,6 +101,7 @@ impl VlessAdapter {
             uuid_bytes,
             flow,
             udp,
+            packet_encoding: VlessPacketEncoding::Packet,
             transport: Arc::new(transport),
             #[cfg(feature = "mux")]
             mux: None,
@@ -98,6 +109,12 @@ impl VlessAdapter {
             encryption: None,
             health: ProxyHealth::new(),
         }
+    }
+
+    /// Select the VLESS UDP packet encoding.
+    pub fn with_packet_encoding(mut self, packet_encoding: VlessPacketEncoding) -> Self {
+        self.packet_encoding = packet_encoding;
+        self
     }
 
     /// Enable connection multiplexing.  Two wire protocols share one
@@ -347,6 +364,46 @@ impl ProxyAdapter for VlessAdapter {
         let stream = self.dial_stream().await?;
         let addr = addr_from_metadata(metadata);
 
+        if self.packet_encoding == VlessPacketEncoding::Xudp {
+            #[cfg(feature = "mux")]
+            {
+                let host = metadata_host(metadata, "vless xudp")?;
+                let flow_str = match self.flow {
+                    #[cfg(feature = "vless-vision")]
+                    Some(VlessFlow::XtlsRprxVision) => Some("xtls-rprx-vision"),
+                    _ => None,
+                };
+                let conn: Box<dyn ProxyConn> = {
+                    #[cfg(feature = "vless-vision")]
+                    if flow_str.is_some() {
+                        let vless =
+                            VlessConn::new_mux_deferred(stream, &self.uuid_bytes, flow_str).await?;
+                        Box::new(VisionConn::new(vless, self.uuid_bytes))
+                    } else {
+                        let vless = VlessConn::new_mux(stream, &self.uuid_bytes, flow_str).await?;
+                        Box::new(StreamConn(Box::new(vless)))
+                    }
+                    #[cfg(not(feature = "vless-vision"))]
+                    {
+                        let vless = VlessConn::new_mux(stream, &self.uuid_bytes, flow_str).await?;
+                        Box::new(StreamConn(Box::new(vless)))
+                    }
+                };
+                let packet = crate::mux::muxcool::new_packet_conn(conn, &host, metadata.dst_port)
+                    .await
+                    .map_err(MeowError::Io)?;
+                return Ok(Box::new(packet));
+            }
+            #[cfg(not(feature = "mux"))]
+            {
+                return Err(MeowError::Config(
+                    "vless: packet-encoding xudp requires the `mux` Cargo feature; \
+                     rebuild with --features mux"
+                        .into(),
+                ));
+            }
+        }
+
         let conn = VlessPacketConn::new(stream, &self.uuid_bytes, metadata.dst_port, &addr).await?;
 
         Ok(Box::new(conn))
@@ -357,12 +414,29 @@ impl ProxyAdapter for VlessAdapter {
     }
 }
 
+#[cfg(feature = "mux")]
+fn metadata_host(metadata: &Metadata, adapter: &str) -> Result<String> {
+    if !metadata.host.is_empty() {
+        Ok(metadata.host.to_string())
+    } else if let Some(ip) = metadata.dst_ip {
+        Ok(ip.to_string())
+    } else {
+        Err(MeowError::Proxy(format!(
+            "{adapter}: metadata has no destination host"
+        )))
+    }
+}
+
 // ─── Crate invariants + struct tests (§E, §I) ────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use meow_common::AdapterType;
+    #[cfg(all(feature = "mux", feature = "vless-vision"))]
+    use meow_common::Network;
+    #[cfg(all(feature = "mux", feature = "vless-vision"))]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn make_adapter(flow: Option<VlessFlow>, udp: bool) -> VlessAdapter {
         VlessAdapter::new(
@@ -462,5 +536,85 @@ mod tests {
         #[cfg(feature = "vless-vision")]
         let _ = make_adapter(Some(VlessFlow::XtlsRprxVision), true);
         let _ = make_adapter(None, true);
+    }
+
+    #[test]
+    fn vless_packet_encoding_defaults_to_ordinary_udp() {
+        let a = make_adapter(None, true);
+        assert_eq!(a.packet_encoding, VlessPacketEncoding::Packet);
+    }
+
+    #[test]
+    fn vless_packet_encoding_can_select_xudp() {
+        let a = make_adapter(None, true).with_packet_encoding(VlessPacketEncoding::Xudp);
+        assert_eq!(a.packet_encoding, VlessPacketEncoding::Xudp);
+    }
+
+    #[cfg(all(feature = "mux", feature = "vless-vision"))]
+    #[tokio::test]
+    async fn vision_udp_xudp_uses_command_mux_and_udp_new_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 37];
+            tcp.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[0], 0x00);
+            assert_eq!(&request[1..17], &[0u8; 16]);
+            assert_eq!(request[17], 18);
+            assert_eq!(&request[20..36], b"xtls-rprx-vision");
+            assert_eq!(request[36], Cmd::Mux as u8);
+
+            tcp.write_all(&[0x00, 0x00]).await.unwrap();
+
+            let mut vision_header = [0u8; 21];
+            tcp.read_exact(&mut vision_header).await.unwrap();
+            assert_eq!(&vision_header[..16], &[0u8; 16]);
+            assert_eq!(
+                vision_header[16], 0x01,
+                "non-TLS XUDP frame ends Vision padding"
+            );
+            let content_len = u16::from_be_bytes([vision_header[17], vision_header[18]]) as usize;
+            let padding_len = u16::from_be_bytes([vision_header[19], vision_header[20]]) as usize;
+            let mut content = vec![0u8; content_len];
+            tcp.read_exact(&mut content).await.unwrap();
+            let mut padding = vec![0u8; padding_len];
+            tcp.read_exact(&mut padding).await.unwrap();
+
+            let meta_len = u16::from_be_bytes([content[0], content[1]]) as usize;
+            let meta = &content[2..2 + meta_len];
+            assert_eq!(u16::from_be_bytes([meta[0], meta[1]]), 1, "first mux sid");
+            assert_eq!(meta[2], 0x01, "Mux.Cool status New");
+            assert_eq!(meta[3], 0x00, "New frame has no payload");
+            assert_eq!(meta[4], 0x02, "New frame must declare UDP");
+            assert_eq!(u16::from_be_bytes([meta[5], meta[6]]), 53);
+            assert_eq!(meta[7], 0x01, "IPv4 destination");
+            assert_eq!(&meta[8..12], &[8, 8, 8, 8]);
+            seen_tx.send(()).unwrap();
+        });
+
+        let adapter = VlessAdapter::new(
+            "vision-xudp",
+            "127.0.0.1",
+            server_addr.port(),
+            [0u8; 16],
+            Some(VlessFlow::XtlsRprxVision),
+            true,
+            TransportChain::empty(),
+        )
+        .with_packet_encoding(VlessPacketEncoding::Xudp);
+
+        let metadata = Metadata {
+            network: Network::Udp,
+            dst_ip: Some("8.8.8.8".parse().unwrap()),
+            dst_port: 53,
+            ..Default::default()
+        };
+
+        let conn = adapter.dial_udp(&metadata).await.unwrap();
+        seen_rx.await.unwrap();
+        drop(conn);
     }
 }

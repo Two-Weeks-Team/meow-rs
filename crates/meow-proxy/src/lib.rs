@@ -73,7 +73,7 @@ pub use transport_chain::TransportChain;
 pub use trojan::TrojanAdapter;
 
 #[cfg(feature = "vless")]
-pub use vless_adapter::{VlessAdapter, VlessFlow};
+pub use vless_adapter::{VlessAdapter, VlessFlow, VlessPacketEncoding};
 
 #[cfg(feature = "vless-encryption")]
 pub use vless::encryption::{parse_client_encryption, ClientInstance as VlessEncryptionClient};

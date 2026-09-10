@@ -1345,6 +1345,68 @@ proxies:
     );
 }
 
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_vision_udp_xudp_loads_without_plain_udp_warning() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    flow: "xtls-rprx-vision"
+    udp: true
+    packet-encoding: xudp
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("vision + xudp must parse");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("ordinary VLESS UDP") || l.contains("plain VLESS")),
+        "xudp must not warn as ordinary UDP; captured lines: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn parse_vless_packet_encoding_empty_preserves_ordinary_udp() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    udp: true
+    packet_encoding: ""
+"#;
+    load_config_from_str(yaml)
+        .await
+        .expect("explicit empty packet_encoding is ordinary VLESS UDP");
+}
+
+#[tokio::test]
+async fn parse_vless_packet_encoding_unknown_skips_proxy() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    udp: true
+    packet-encoding: nope
+"#;
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("load continues after proxy parse error");
+    assert!(!config.proxies.contains_key("v"));
+}
+
 // ─── D18: UUID dashed and hex-only both accepted ──────────────────────────────
 
 /// D18: `parse_vless_uuid_hex_and_dashed_both_accepted`

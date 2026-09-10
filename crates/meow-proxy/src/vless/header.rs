@@ -360,6 +360,23 @@ mod tests {
         assert_eq!(buf[36], 0x01, "cmd TCP follows addon");
     }
 
+    #[cfg(feature = "mux")]
+    #[test]
+    fn header_encode_mux_with_vision_has_flow_and_no_destination() {
+        let mut buf = BytesMut::new();
+        encode_mux_request(&mut buf, &TEST_UUID, Some("xtls-rprx-vision"));
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(&buf[1..17], &TEST_UUID);
+        assert_eq!(buf[17], 18);
+        assert_eq!(&buf[20..36], b"xtls-rprx-vision");
+        assert_eq!(buf[36], Cmd::Mux as u8, "XUDP must use CommandMux");
+        assert_eq!(
+            buf.len(),
+            37,
+            "CommandMux request must not append a UDP port/address"
+        );
+    }
+
     // ─── A8/A9: domain length validation ─────────────────────────────────────
 
     #[test]

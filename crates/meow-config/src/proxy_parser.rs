@@ -12,7 +12,7 @@ use meow_proxy::{
     SelectorGroup, Socks5Adapter, UrlTestGroup,
 };
 #[cfg(feature = "vless")]
-use meow_proxy::{TransportChain, VlessAdapter, VlessFlow};
+use meow_proxy::{TransportChain, VlessAdapter, VlessFlow, VlessPacketEncoding};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1103,7 +1103,8 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
 ///
 /// - `tls: false` with plain VLESS — plaintext, but correct destination
 /// - `mux: { enabled: true }` — sing-mux multiplexing (server must be sing-box/mihomo)
-/// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP uses plain VLESS
+/// - `flow: xtls-rprx-vision` + `udp: true` + ordinary UDP — Vision is TCP-only;
+///   use `packet-encoding: xudp` for Vision-compatible UDP.
 /// - `reality-opts.short-id` given as a bare YAML number (e.g. `0x1f`) —
 ///   coerced to its decimal digits before hex-decoding (matching mihomo),
 ///   which can silently reinterpret the value; quote it to preserve the
@@ -1138,6 +1139,7 @@ fn parse_vless(
         .get("udp")
         .and_then(serde_yaml::Value::as_bool)
         .unwrap_or(false);
+    let packet_encoding = parse_vless_packet_encoding(config)?;
     let tls = config
         .get("tls")
         .and_then(serde_yaml::Value::as_bool)
@@ -1264,12 +1266,15 @@ fn parse_vless(
 
     // ── Warn: Vision + UDP (Class B) ─────────────────────────────────────
     if flow == Some(VlessFlow::XtlsRprxVision) && udp {
-        tracing::warn!(
-            proxy = %name,
-            "flow: xtls-rprx-vision applies to TCP only; UDP relays on \
-             this proxy will use plain VLESS (Vision's inner-TLS splice \
-             is not defined for UDP datagrams). (Class B divergence)"
-        );
+        match packet_encoding {
+            VlessPacketEncoding::Xudp => {}
+            VlessPacketEncoding::Packet => tracing::warn!(
+                proxy = %name,
+                "flow: xtls-rprx-vision with ordinary VLESS UDP is not compatible \
+                 with Vision-only servers; set `packet-encoding: xudp` for \
+                 Vision-compatible UDP over CommandMux. (Class B divergence)"
+            ),
+        }
     }
 
     // ── Build transport chain ──────────────────────────────────────────────
@@ -1452,7 +1457,8 @@ fn parse_vless(
     }
 
     #[cfg_attr(not(feature = "vless-encryption"), allow(unused_mut))]
-    let mut adapter = VlessAdapter::new(name, server, port, uuid_bytes, flow, udp, chain);
+    let mut adapter = VlessAdapter::new(name, server, port, uuid_bytes, flow, udp, chain)
+        .with_packet_encoding(packet_encoding);
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
 
@@ -1485,6 +1491,40 @@ fn parse_vless(
     parse_mux_options(name, config)?;
 
     Ok(adapter)
+}
+
+#[cfg(feature = "vless")]
+fn parse_vless_packet_encoding(
+    config: &HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<VlessPacketEncoding, String> {
+    let value = config
+        .get("packet-encoding")
+        .or_else(|| config.get("packet_encoding"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match value {
+        "" => Ok(VlessPacketEncoding::Packet),
+        "xudp" => {
+            #[cfg(not(feature = "mux"))]
+            {
+                return Err(
+                    "vless: packet-encoding xudp requires the `mux` Cargo feature; \
+                     rebuild with --features mux"
+                        .into(),
+                );
+            }
+            #[cfg(feature = "mux")]
+            {
+                Ok(VlessPacketEncoding::Xudp)
+            }
+        }
+        "packetaddr" => Err(
+            "vless: packet-encoding packetaddr is not supported; valid values: '' or 'xudp'".into(),
+        ),
+        other => Err(format!(
+            "vless: unknown packet-encoding '{other}'; valid values: '' or 'xudp'"
+        )),
+    }
 }
 
 /// Parse the optional mihomo `smux:` block shared by
