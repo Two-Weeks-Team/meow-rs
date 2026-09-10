@@ -266,14 +266,21 @@ fn setup_global_auto_route(
     configured_iface: Option<String>,
     listener_name: &str,
 ) -> io::Result<AutoRouteGuard> {
-    let physical_egress = if configured_iface.as_ref().is_some_and(|s| !s.is_empty()) {
-        None
-    } else {
-        Some(route::default_egress().map_err(|e| {
+    let configured_iface = configured_iface.filter(|s| !s.is_empty());
+    let physical_egress = match configured_iface.as_deref() {
+        #[cfg(target_os = "macos")]
+        Some(iface) => Some(route::default_egress_for_interface(iface).map_err(|e| {
+            io::Error::other(format!(
+                "tun auto-route: global: could not capture IPv4 default egress for configured outbound interface '{iface}' ({e})"
+            ))
+        })?),
+        #[cfg(not(target_os = "macos"))]
+        Some(_) => None,
+        None => Some(route::default_egress().map_err(|e| {
             io::Error::other(format!(
                 "tun auto-route: global: could not capture the physical egress ({e})"
             ))
-        })?)
+        })?),
     };
     let iface = route::outbound_interface_name(configured_iface, physical_egress.as_ref())
         .map_err(|e| {
@@ -288,7 +295,7 @@ fn setup_global_auto_route(
              refusing to install default routes without loop avoidance"
         ))
     })?;
-    let route_guard = RouteGuard::setup_global(if_index)?;
+    let route_guard = RouteGuard::setup_global(if_index, physical_egress.as_ref())?;
     info!(
         "tun '{}': global route scope — outbound sockets bound to '{iface}' \
          (experimental, #375)",

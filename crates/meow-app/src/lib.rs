@@ -206,6 +206,64 @@ pub async fn run(
     tunnel.set_mode(config.general.mode);
     tunnel.update_rules(config.rules);
     tunnel.update_proxies(config.proxies);
+    // Establish TUN egress binding and routes before background probes or
+    // listeners can create cached proxy connections. Hysteria2 sockets bind
+    // only at creation; a pre-TUN QUIC socket cannot be rebound afterward.
+    // TUN inbound (issue #326) — spawned from the top-level `tun:` section,
+    // not the `listeners:` array (mihomo layout).
+    if config.tun.enable {
+        #[cfg(feature = "listener-tun")]
+        {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let listener = TunListener::new(
+                tunnel.clone(),
+                tun_config_to_listener_config(&config.tun),
+                "meow-tun".to_string(),
+            )
+            .with_readiness_signal(ready_tx);
+
+            let handle = tokio::spawn(async move {
+                if let Err(e) = listener.run().await {
+                    error!("TUN listener error: {}", e);
+                }
+            });
+
+            // Await device readiness before treating TUN as "running".
+            // If device creation fails (permission denied, etc.) the
+            // notifier sends `TunReady::Failed` immediately — no timeout
+            // wait.  Only a genuinely stuck setup hits the timeout.
+            match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
+                Ok(Ok(meow_listener::TunReady::Ready)) => {
+                    tunnel.set_tun_handle(handle).await;
+                }
+                Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
+                    if msg.contains("wintun.dll") {
+                        error!("TUN listener failed to start: {msg}");
+                    } else {
+                        error!(
+                            "TUN listener failed to start: {msg} — \
+                             check permissions / admin / CAP_NET_ADMIN"
+                        );
+                    }
+                    handle.abort();
+                }
+                Ok(Err(_)) => {
+                    error!("TUN listener readiness signal dropped unexpectedly");
+                    handle.abort();
+                }
+                Err(_) => {
+                    error!(
+                        "TUN listener startup timed out after {} s",
+                        meow_api::TUN_STARTUP_TIMEOUT.as_secs()
+                    );
+                    handle.abort();
+                }
+            }
+        }
+        #[cfg(not(feature = "listener-tun"))]
+        warn!("tun.enable is set but this build lacks the 'listener-tun' feature");
+    }
+
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
@@ -432,61 +490,6 @@ pub async fn run(
                 error!("API server error: {}", e);
             }
         });
-    }
-
-    // TUN inbound (issue #326) — spawned from the top-level `tun:` section,
-    // not the `listeners:` array (mihomo layout).
-    if config.tun.enable {
-        #[cfg(feature = "listener-tun")]
-        {
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let listener = TunListener::new(
-                tunnel.clone(),
-                tun_config_to_listener_config(&config.tun),
-                "meow-tun".to_string(),
-            )
-            .with_readiness_signal(ready_tx);
-
-            let handle = tokio::spawn(async move {
-                if let Err(e) = listener.run().await {
-                    error!("TUN listener error: {}", e);
-                }
-            });
-
-            // Await device readiness before treating TUN as "running".
-            // If device creation fails (permission denied, etc.) the
-            // notifier sends `TunReady::Failed` immediately — no timeout
-            // wait.  Only a genuinely stuck setup hits the timeout.
-            match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
-                Ok(Ok(meow_listener::TunReady::Ready)) => {
-                    tunnel.set_tun_handle(handle).await;
-                }
-                Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
-                    if msg.contains("wintun.dll") {
-                        error!("TUN listener failed to start: {msg}");
-                    } else {
-                        error!(
-                            "TUN listener failed to start: {msg} — \
-                             check permissions / admin / CAP_NET_ADMIN"
-                        );
-                    }
-                    handle.abort();
-                }
-                Ok(Err(_)) => {
-                    error!("TUN listener readiness signal dropped unexpectedly");
-                    handle.abort();
-                }
-                Err(_) => {
-                    error!(
-                        "TUN listener startup timed out after {} s",
-                        meow_api::TUN_STARTUP_TIMEOUT.as_secs()
-                    );
-                    handle.abort();
-                }
-            }
-        }
-        #[cfg(not(feature = "listener-tun"))]
-        warn!("tun.enable is set but this build lacks the 'listener-tun' feature");
     }
 
     if let Some(on_ready) = on_ready {
