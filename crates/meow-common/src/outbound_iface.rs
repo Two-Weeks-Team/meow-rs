@@ -9,7 +9,7 @@
 //! `IP_UNICAST_IF`).
 
 use std::io;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
