@@ -19,6 +19,7 @@ use std::{
 
 const SALAMANDER_SALT_LEN: usize = 8;
 const MAX_DATAGRAM_SIZE: usize = 65_535;
+const MAX_RECV_WORK: usize = 64;
 const HY2_MIN_HOP_INTERVAL_SECS: u64 = 5;
 const HY2_DEFAULT_HOP_INTERVAL_SECS: u64 = 30;
 
@@ -28,6 +29,14 @@ pub struct Hy2UdpSocket {
     server_addr: SocketAddr,
     hop: Option<Mutex<HopState>>,
     obfs: Option<Salamander>,
+    recv: Mutex<ObfsRecvState>,
+}
+
+#[derive(Debug, Default)]
+struct ObfsRecvState {
+    encrypted: Vec<u8>,
+    meta: RecvMeta,
+    offset: usize,
 }
 
 impl Hy2UdpSocket {
@@ -52,6 +61,7 @@ impl Hy2UdpSocket {
             hop: HopState::new(hop_ports, hop_interval_min_secs, hop_interval_max_secs)?
                 .map(Mutex::new),
             obfs: (!obfs_password.is_empty()).then(|| Salamander::new(obfs_password.as_bytes())),
+            recv: Mutex::new(ObfsRecvState::default()),
         }))
     }
 
@@ -156,50 +166,66 @@ impl AsyncUdpSocket for Hy2UdpSocket {
             )));
         }
 
-        loop {
-            let mut encrypted = vec![0u8; MAX_DATAGRAM_SIZE];
-            let mut encrypted_bufs = [IoSliceMut::new(&mut encrypted)];
-            let mut encrypted_meta = [RecvMeta::default()];
-            let n = match self
-                .inner
-                .poll_recv(cx, &mut encrypted_bufs, &mut encrypted_meta)
-            {
-                Poll::Ready(Ok(n)) => n,
-                other => return other,
-            };
-            if n == 0 {
-                return Poll::Ready(Ok(0));
-            }
-
-            let raw_len = encrypted_meta[0].len;
-            let stride = encrypted_meta[0].stride.max(raw_len);
-            let mut offset = 0usize;
-            while offset < raw_len {
-                let end = (offset + stride).min(raw_len);
-                let received = &encrypted[offset..end];
-                let Some(plain) = obfs.decode(received) else {
-                    offset = end;
-                    continue;
+        let mut recv = self.recv.lock().expect("hysteria2 receive mutex poisoned");
+        for _ in 0..MAX_RECV_WORK {
+            if recv.offset >= recv.meta.len {
+                // The inner socket may enable GRO even though this wrapper emits
+                // one datagram per poll. Hold one aggregate, including each salt,
+                // and retain unconsumed segments across calls.
+                let capacity = (bufs[0].len() + SALAMANDER_SALT_LEN)
+                    .saturating_mul(self.inner.max_receive_segments())
+                    .max(MAX_DATAGRAM_SIZE);
+                recv.encrypted.resize(capacity, 0);
+                let mut encrypted_bufs = [IoSliceMut::new(&mut recv.encrypted)];
+                let mut encrypted_meta = [RecvMeta::default()];
+                let n = match self
+                    .inner
+                    .poll_recv(cx, &mut encrypted_bufs, &mut encrypted_meta)
+                {
+                    Poll::Ready(Ok(n)) => n,
+                    other => return other,
                 };
-
-                if plain.len() > bufs[0].len() {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "received UDP datagram exceeds buffer",
-                    )));
+                if n == 0 {
+                    return Poll::Ready(Ok(0));
                 }
-                bufs[0][..plain.len()].copy_from_slice(&plain);
-                let source = self.incoming_source(encrypted_meta[0].addr);
-                meta[0] = RecvMeta {
-                    addr: source,
-                    len: plain.len(),
-                    stride: plain.len(),
-                    ecn: encrypted_meta[0].ecn,
-                    dst_ip: encrypted_meta[0].dst_ip,
-                };
-                return Poll::Ready(Ok(1));
+                recv.meta = encrypted_meta[0];
+                recv.offset = 0;
+                if recv.meta.len > recv.encrypted.len() || recv.meta.stride == 0 {
+                    recv.meta.len = 0;
+                    continue;
+                }
+                tracing::trace!(
+                    "hysteria2 UDP receive batch len={} stride={} capacity={}",
+                    recv.meta.len,
+                    recv.meta.stride,
+                    bufs[0].len()
+                );
             }
+
+            let offset = recv.offset;
+            let end = offset.saturating_add(recv.meta.stride).min(recv.meta.len);
+            recv.offset = end;
+            let Some(plain) = obfs.decode(&recv.encrypted[offset..end]) else {
+                continue;
+            };
+            // Invalid or oversized network input is a dropped datagram, not an
+            // endpoint I/O failure. Other segments and future receives survive.
+            if plain.len() > bufs[0].len() {
+                continue;
+            }
+            bufs[0][..plain.len()].copy_from_slice(&plain);
+            meta[0] = RecvMeta {
+                addr: self.incoming_source(recv.meta.addr),
+                len: plain.len(),
+                stride: plain.len(),
+                ecn: recv.meta.ecn,
+                dst_ip: recv.meta.dst_ip,
+            };
+            return Poll::Ready(Ok(1));
         }
+        // Yield after a bounded number of rejected packets under sustained input.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -419,6 +445,10 @@ fn parse_port(raw: &str) -> Result<u16> {
     }
     Ok(port)
 }
+
+#[cfg(test)]
+#[path = "socket_recv_tests.rs"]
+mod recv_tests;
 
 #[cfg(test)]
 mod tests {

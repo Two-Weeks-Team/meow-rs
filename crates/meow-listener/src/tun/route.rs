@@ -2,10 +2,13 @@
 //!
 //! Fake-IP mode deliberately routes only the fake-IP range into the device
 //! (see the module docs in `mod.rs` for the loop-freedom argument). Global
-//! mode installs only owned split defaults into the device. Existing
-//! more-specific LAN routes are left untouched; outbound sockets bind to the
-//! physical interface for proxy and DIRECT egress. Routes are added with the
-//! blocking `route_manager` API at listener startup and removed on drop.
+//! mode installs owned split defaults into the device. On macOS it first
+//! ensures a scoped physical default route exists for sockets bound with
+//! `IP_BOUND_IF`; that route is owned and cleaned up only when meow added it.
+//! Existing more-specific LAN routes are left untouched; outbound sockets bind
+//! to the physical interface for proxy and DIRECT egress. Routes are added
+//! with the blocking `route_manager` API at listener startup and removed on
+//! drop.
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -17,12 +20,21 @@ use tracing::{debug, warn};
 pub(super) struct PhysicalEgress {
     if_index: Option<u32>,
     if_name: Option<String>,
+    gateway: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PlannedRoute {
-    net: IpNet,
-    if_index: u32,
+enum PlannedRoute {
+    Tun {
+        net: IpNet,
+        if_index: u32,
+    },
+    #[cfg(target_os = "macos")]
+    MacScopedDefault {
+        if_index: u32,
+        if_name: Option<String>,
+        gateway: IpAddr,
+    },
 }
 
 pub(super) struct RouteGuard {
@@ -44,9 +56,16 @@ impl RouteGuard {
     /// Install global-capture routes and fail closed on any add failure.
     /// Already-added routes are removed before returning the error, so a
     /// startup failure cannot leave half of the split default active.
-    pub(super) fn setup_global(if_index: u32) -> std::io::Result<Self> {
+    pub(super) fn setup_global(
+        if_index: u32,
+        physical: Option<&PhysicalEgress>,
+    ) -> std::io::Result<Self> {
         let mut manager = RouteManager::new()?;
-        let plan = global_route_plan(if_index);
+        #[cfg(target_os = "macos")]
+        let existing = manager.list()?;
+        #[cfg(not(target_os = "macos"))]
+        let existing = Vec::new();
+        let plan = global_route_plan(if_index, physical, &existing)?;
         let installed = add_required_with_rollback(&mut manager, &plan)?;
         Ok(Self { manager, installed })
     }
@@ -116,34 +135,136 @@ fn add_required_with_rollback(
 
 impl PlannedRoute {
     fn to_route(&self) -> Route {
-        let mut route = Route::new(self.net.network(), self.net.prefix_len());
-        route = route.with_if_index(self.if_index);
-        route
+        match self {
+            PlannedRoute::Tun { net, if_index } => {
+                Route::new(net.network(), net.prefix_len()).with_if_index(*if_index)
+            }
+            #[cfg(target_os = "macos")]
+            PlannedRoute::MacScopedDefault {
+                if_index,
+                if_name,
+                gateway,
+            } => {
+                let mut route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                    .with_gateway(*gateway)
+                    .with_if_index(*if_index)
+                    .with_if_scope(true);
+                if let Some(name) = if_name.clone() {
+                    route = route.with_if_name(name);
+                }
+                route
+            }
+        }
     }
 
     fn describe(&self) -> String {
-        format!("{} via tun if_index {}", self.net, self.if_index)
+        match self {
+            PlannedRoute::Tun { net, if_index } => {
+                format!("{net} via tun if_index {if_index}")
+            }
+            #[cfg(target_os = "macos")]
+            PlannedRoute::MacScopedDefault {
+                if_index, gateway, ..
+            } => format!("default via gateway {gateway} scoped to if_index {if_index}"),
+        }
     }
 }
 
 fn fake_ip_route_plan(if_index: u32, nets: &[IpNet]) -> Vec<PlannedRoute> {
     nets.iter()
         .copied()
-        .map(|net| PlannedRoute { net, if_index })
+        .map(|net| PlannedRoute::Tun { net, if_index })
         .collect()
 }
 
-fn global_route_plan(if_index: u32) -> Vec<PlannedRoute> {
-    vec![
-        PlannedRoute {
+fn global_route_plan(
+    if_index: u32,
+    physical: Option<&PhysicalEgress>,
+    existing: &[Route],
+) -> std::io::Result<Vec<PlannedRoute>> {
+    let mut routes = Vec::with_capacity(3);
+
+    #[cfg(target_os = "macos")]
+    {
+        let scoped_default = macos_scoped_default_plan(physical)?;
+        if !existing.iter().any(|route| scoped_default.matches(route)) {
+            routes.push(PlannedRoute::MacScopedDefault {
+                if_index: scoped_default.if_index,
+                if_name: scoped_default.if_name,
+                gateway: scoped_default.gateway,
+            });
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = physical;
+        let _ = existing;
+    }
+
+    routes.extend([
+        PlannedRoute::Tun {
             net: cidr("0.0.0.0/1"),
             if_index,
         },
-        PlannedRoute {
+        PlannedRoute::Tun {
             net: cidr("128.0.0.0/1"),
             if_index,
         },
-    ]
+    ]);
+    Ok(routes)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacScopedDefaultPlan {
+    if_index: u32,
+    if_name: Option<String>,
+    gateway: IpAddr,
+}
+
+#[cfg(target_os = "macos")]
+impl MacScopedDefaultPlan {
+    fn matches(&self, route: &Route) -> bool {
+        route.destination() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            && route.prefix() == 0
+            && route.gateway() == Some(self.gateway)
+            && route.if_scope()
+            && (route.if_index() == Some(self.if_index)
+                || self
+                    .if_name
+                    .as_ref()
+                    .is_some_and(|name| route.if_name() == Some(name)))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_scoped_default_plan(
+    physical: Option<&PhysicalEgress>,
+) -> std::io::Result<MacScopedDefaultPlan> {
+    let Some(physical) = physical else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "macOS global auto-route requires the pre-TUN physical egress",
+        ));
+    };
+    let if_index = physical.if_index.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "macOS physical egress did not include an interface index",
+        )
+    })?;
+    let gateway = physical.gateway.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "macOS physical egress did not include a gateway for scoped default route",
+        )
+    })?;
+    Ok(MacScopedDefaultPlan {
+        if_index,
+        if_name: physical.if_name.clone(),
+        gateway,
+    })
 }
 
 fn cidr(net: &str) -> IpNet {
@@ -158,10 +279,54 @@ pub(super) fn default_egress() -> std::io::Result<PhysicalEgress> {
             std::io::Error::new(std::io::ErrorKind::NotFound, "no IPv4 default route found")
         })?;
 
-    Ok(PhysicalEgress {
+    Ok(physical_egress_from_route(&route))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn default_egress_for_interface(configured: &str) -> std::io::Result<PhysicalEgress> {
+    let mut manager = RouteManager::new()?;
+    let routes = manager.list()?;
+    default_egress_for_interface_from_routes(configured, &routes)
+}
+
+fn physical_egress_from_route(route: &Route) -> PhysicalEgress {
+    PhysicalEgress {
         if_index: route.if_index(),
         if_name: route.if_name().cloned(),
-    })
+        gateway: route.gateway(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn default_egress_for_interface_from_routes(
+    configured: &str,
+    routes: &[Route],
+) -> std::io::Result<PhysicalEgress> {
+    routes
+        .iter()
+        .find(|route| {
+            route.destination() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                && route.prefix() == 0
+                && route.gateway().is_some()
+                && route_matches_interface(route, configured)
+        })
+        .map(physical_egress_from_route)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no IPv4 default route found for outbound interface '{configured}'"),
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn route_matches_interface(route: &Route, configured: &str) -> bool {
+    if route.if_name().is_some_and(|name| name == configured) {
+        return true;
+    }
+    configured
+        .parse::<u32>()
+        .is_ok_and(|index| route.if_index() == Some(index))
 }
 
 /// Pick a usable interface identifier for the outbound-socket binding hook.
@@ -220,7 +385,7 @@ fn linux_if_index_to_name(index: u32) -> std::io::Result<String> {
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
-        for route in &self.installed {
+        for route in self.installed.iter().rev() {
             if let Err(e) = self.manager.delete(route) {
                 warn!("tun auto-route: failed to remove {route}: {e}");
             }
@@ -233,12 +398,111 @@ mod tests {
     use super::*;
     use ipnet::Ipv4Net;
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn global_route_plan_only_owns_split_defaults() {
-        let plan = global_route_plan(42);
-        let nets: Vec<String> = plan.iter().map(|p| p.net.to_string()).collect();
+        let plan = global_route_plan(42, None, &[]).unwrap();
+        let nets: Vec<String> = plan
+            .iter()
+            .map(|p| match p {
+                PlannedRoute::Tun { net, .. } => net.to_string(),
+            })
+            .collect();
         assert_eq!(nets, vec!["0.0.0.0/1", "128.0.0.0/1"]);
-        assert!(plan.iter().all(|p| p.if_index == 42));
+        assert!(plan
+            .iter()
+            .all(|p| matches!(p, PlannedRoute::Tun { if_index: 42, .. })));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_global_route_plan_adds_scoped_default_before_split_defaults() {
+        let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 64, 1));
+        let physical = PhysicalEgress {
+            if_index: Some(7),
+            if_name: Some("en0".into()),
+            gateway: Some(gateway),
+        };
+        let plan = global_route_plan(42, Some(&physical), &[]).unwrap();
+        assert_eq!(plan.len(), 3);
+        assert!(matches!(
+            &plan[0],
+            PlannedRoute::MacScopedDefault {
+                if_index: 7,
+                if_name,
+                gateway: route_gateway,
+            } if if_name.as_deref() == Some("en0") && *route_gateway == gateway
+        ));
+        assert!(matches!(
+            &plan[1],
+            PlannedRoute::Tun { net, if_index: 42 } if net.to_string() == "0.0.0.0/1"
+        ));
+        assert!(matches!(
+            &plan[2],
+            PlannedRoute::Tun { net, if_index: 42 } if net.to_string() == "128.0.0.0/1"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_global_route_plan_preserves_existing_scoped_default() {
+        let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 64, 1));
+        let physical = PhysicalEgress {
+            if_index: Some(7),
+            if_name: Some("en0".into()),
+            gateway: Some(gateway),
+        };
+        let existing = vec![Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            .with_gateway(gateway)
+            .with_if_index(7)
+            .with_if_name("en0".into())
+            .with_if_scope(true)];
+        let plan = global_route_plan(42, Some(&physical), &existing).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert!(plan
+            .iter()
+            .all(|planned| matches!(planned, PlannedRoute::Tun { .. })));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_global_route_plan_requires_physical_gateway() {
+        let physical = PhysicalEgress {
+            if_index: Some(7),
+            if_name: Some("en0".into()),
+            gateway: None,
+        };
+        let err = global_route_plan(42, Some(&physical), &[]).unwrap_err();
+        assert!(err.to_string().contains("gateway"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_configured_interface_selects_matching_default_route() {
+        let en0_gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 64, 1));
+        let en1_gateway = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_gateway(en0_gateway)
+                .with_if_index(7)
+                .with_if_name("en0".into()),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_gateway(en1_gateway)
+                .with_if_index(8)
+                .with_if_name("en1".into()),
+        ];
+
+        let by_name = default_egress_for_interface_from_routes("en1", &routes).unwrap();
+        assert_eq!(by_name.if_index, Some(8));
+        assert_eq!(by_name.if_name.as_deref(), Some("en1"));
+        assert_eq!(by_name.gateway, Some(en1_gateway));
+
+        let by_index = default_egress_for_interface_from_routes("7", &routes).unwrap();
+        assert_eq!(by_index.if_index, Some(7));
+        assert_eq!(by_index.gateway, Some(en0_gateway));
+
+        let err = default_egress_for_interface_from_routes("en2", &routes).unwrap_err();
+        assert!(err.to_string().contains("en2"), "{err}");
     }
 
     #[test]
@@ -248,8 +512,10 @@ mod tests {
         )];
         let plan = fake_ip_route_plan(9, &nets);
         assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].net.to_string(), "198.18.0.0/16");
-        assert_eq!(plan[0].if_index, 9);
+        assert!(matches!(
+            &plan[0],
+            PlannedRoute::Tun { net, if_index: 9 } if net.to_string() == "198.18.0.0/16"
+        ));
     }
 
     #[derive(Default)]
@@ -276,7 +542,16 @@ mod tests {
 
     #[test]
     fn required_setup_rolls_back_on_add_failure() {
-        let plan = global_route_plan(42);
+        let plan = vec![
+            PlannedRoute::Tun {
+                net: cidr("0.0.0.0/1"),
+                if_index: 42,
+            },
+            PlannedRoute::Tun {
+                net: cidr("128.0.0.0/1"),
+                if_index: 42,
+            },
+        ];
         let mut backend = FakeBackend {
             fail_add_at: Some(1),
             ..Default::default()
@@ -288,6 +563,26 @@ mod tests {
             backend.deletes,
             backend.adds.iter().rev().cloned().collect::<Vec<_>>()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn required_setup_rolls_back_owned_scoped_default_on_split_failure() {
+        let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 64, 1));
+        let physical = PhysicalEgress {
+            if_index: Some(7),
+            if_name: Some("en0".into()),
+            gateway: Some(gateway),
+        };
+        let plan = global_route_plan(42, Some(&physical), &[]).unwrap();
+        let mut backend = FakeBackend {
+            fail_add_at: Some(1),
+            ..Default::default()
+        };
+        let err = add_required_with_rollback(&mut backend, &plan).unwrap_err();
+        assert!(err.to_string().contains("0.0.0.0/1"), "{err}");
+        assert_eq!(backend.adds.len(), 1);
+        assert_eq!(backend.deletes, backend.adds);
     }
 
     #[test]
@@ -313,6 +608,7 @@ mod tests {
         let physical = PhysicalEgress {
             if_index: Some(7),
             if_name: Some("en0".into()),
+            gateway: None,
         };
         assert_eq!(
             outbound_interface_name(Some("Ethernet".into()), None).unwrap(),
@@ -328,6 +624,7 @@ mod tests {
             let physical = PhysicalEgress {
                 if_index: Some(7),
                 if_name: None,
+                gateway: None,
             };
             assert_eq!(outbound_interface_name(None, Some(&physical)).unwrap(), "7");
         }
@@ -342,6 +639,7 @@ mod tests {
         let physical = PhysicalEgress {
             if_index: Some(lo),
             if_name: None,
+            gateway: None,
         };
         assert_eq!(
             outbound_interface_name(None, Some(&physical)).unwrap(),

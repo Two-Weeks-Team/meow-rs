@@ -15,11 +15,16 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+#[cfg(target_os = "windows")]
+mod windows;
+
 #[derive(Debug)]
 struct OutboundInterface {
     name: Arc<str>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     index: NonZeroU32,
+    #[cfg(target_os = "windows")]
+    changes: windows::InterfaceMonitor,
 }
 
 static INTERFACE: RwLock<Option<Arc<OutboundInterface>>> = RwLock::new(None);
@@ -62,10 +67,15 @@ pub fn set_outbound_interface(name: &str) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         let index = resolve_windows_interface_index(name)?;
-        *INTERFACE.write() = Some(Arc::new(OutboundInterface {
+        let changes = windows::InterfaceMonitor::new(index.get())?;
+        let previous = INTERFACE.write().replace(Arc::new(OutboundInterface {
             name: Arc::from(name),
             index,
+            changes,
         }));
+        // Cancellation may wait for a Windows callback. Never hold the
+        // installed-interface lock while dropping its registration.
+        drop(previous);
         tracing::info!(
             "outbound sockets bound to interface '{}' (index {}, IP_UNICAST_IF)",
             name,
@@ -85,9 +95,19 @@ pub fn set_outbound_interface(name: &str) -> io::Result<()> {
 
 /// Remove the installed interface; subsequent sockets bind normally.
 pub fn clear_outbound_interface() {
-    if INTERFACE.write().take().is_some() {
+    let previous = INTERFACE.write().take();
+    if previous.is_some() {
         tracing::info!("outbound interface binding cleared");
     }
+    drop(previous);
+}
+
+/// Changes to this installation's exact physical IPv4 interface. A generation
+/// survives a down/up cycle with the same index; errors mean the underlay is
+/// unavailable or could not be read. Closing the channel ends this installation.
+#[cfg(target_os = "windows")]
+pub fn outbound_interface_changes() -> Option<tokio::sync::watch::Receiver<Result<u64, Arc<str>>>> {
+    current_interface().map(|iface| iface.changes.subscribe())
 }
 
 /// The currently installed interface, if any.

@@ -49,11 +49,17 @@
 //! creating the device requires root (CAP_NET_ADMIN).
 
 mod device;
+#[cfg(not(target_os = "windows"))]
 mod dns;
 #[cfg(target_os = "windows")]
-mod local_dns;
+#[path = "windows_dns.rs"]
+mod dns;
 mod route;
+#[cfg(any(test, target_os = "windows"))]
+mod tcp_dns;
 mod udp;
+#[cfg(target_os = "windows")]
+mod windows_device;
 #[cfg(any(test, target_os = "windows"))]
 mod wintun;
 
@@ -144,7 +150,8 @@ pub struct TunListenerConfig {
     /// = auto-detect from the default route captured before split defaults
     /// are installed. Ignored in fake-IP scope.
     pub outbound_interface: Option<String>,
-    /// Answer UDP :53 flows with the in-process DNS resolver.
+    /// Answer UDP :53 flows with the in-process DNS resolver. Windows also
+    /// handles TCP DNS for its device-owned OS resolver configuration.
     pub dns_hijack: bool,
     /// Idle timeout for UDP flows (flow-table eviction).
     pub udp_timeout: Duration,
@@ -221,11 +228,12 @@ impl Drop for ReadyNotifier {
     }
 }
 
-/// Wraps [`tun_rs::AsyncDevice`] together with auto-route state in a single
-/// `Arc` so they share one reference-counted lifetime. Field declaration
-/// order drops `auto_route_guard` before `device`, so route cleanup runs while
-/// the adapter still exists.
+/// Wraps [`tun_rs::AsyncDevice`] with owned routes and Windows DNS protection
+/// in one `Arc`. Field order releases filters, then routes, then the adapter.
 struct TunDevice {
+    #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
+    dns_guard: Option<dns::DnsGuard>,
     #[allow(dead_code)]
     auto_route_guard: Option<AutoRouteGuard>,
     pub(super) device: tun_rs::AsyncDevice,
@@ -266,14 +274,21 @@ fn setup_global_auto_route(
     configured_iface: Option<String>,
     listener_name: &str,
 ) -> io::Result<AutoRouteGuard> {
-    let physical_egress = if configured_iface.as_ref().is_some_and(|s| !s.is_empty()) {
-        None
-    } else {
-        Some(route::default_egress().map_err(|e| {
+    let configured_iface = configured_iface.filter(|s| !s.is_empty());
+    let physical_egress = match configured_iface.as_deref() {
+        #[cfg(target_os = "macos")]
+        Some(iface) => Some(route::default_egress_for_interface(iface).map_err(|e| {
+            io::Error::other(format!(
+                "tun auto-route: global: could not capture IPv4 default egress for configured outbound interface '{iface}' ({e})"
+            ))
+        })?),
+        #[cfg(not(target_os = "macos"))]
+        Some(_) => None,
+        None => Some(route::default_egress().map_err(|e| {
             io::Error::other(format!(
                 "tun auto-route: global: could not capture the physical egress ({e})"
             ))
-        })?)
+        })?),
     };
     let iface = route::outbound_interface_name(configured_iface, physical_egress.as_ref())
         .map_err(|e| {
@@ -288,7 +303,7 @@ fn setup_global_auto_route(
              refusing to install default routes without loop avoidance"
         ))
     })?;
-    let route_guard = RouteGuard::setup_global(if_index)?;
+    let route_guard = RouteGuard::setup_global(if_index, physical_egress.as_ref())?;
     info!(
         "tun '{}': global route scope — outbound sockets bound to '{iface}' \
          (experimental, #375)",
@@ -369,9 +384,11 @@ impl TunListener {
         };
 
         // Try up to 5 device names and IPs in case the previous instance
-        // left a stale adapter that hasn't been cleaned up yet (common on
-        // Windows after an unclean shutdown).  After the first retry fails,
-        // we also rotate the TUN IP to work around address conflicts.
+        // left a device that hasn't been cleaned up yet. On Windows, a name
+        // collision leaves that interface untouched; the next attempt uses
+        // another name and must independently prove a fresh adapter GUID.
+        // After the first retry fails, we also rotate the TUN IP to work
+        // around address conflicts.
         //
         // Each attempt runs on a blocking thread; the outer caller's
         // TUN_STARTUP_TIMEOUT guards the overall time spent here.
@@ -413,19 +430,26 @@ impl TunListener {
             );
 
             match tokio::task::spawn_blocking(move || {
-                let mut builder = tun_rs::DeviceBuilder::new()
-                    .mtu(mtu)
-                    .ipv4(addr, prefix, None);
-                if let Some(n) = &name_for_closure {
-                    builder = builder.name(n);
-                }
-                // Pin the Wintun DLL we resolved above so tun-rs does not
-                // walk the process DLL search path.
                 #[cfg(target_os = "windows")]
                 {
-                    builder = builder.wintun_file(wintun_file).wintun_log(true);
+                    windows_device::create_owned(
+                        name_for_closure.as_deref().unwrap_or("meow-tun"),
+                        wintun_file,
+                        mtu,
+                        addr,
+                        prefix,
+                    )
                 }
-                builder.build_async()
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let mut builder = tun_rs::DeviceBuilder::new()
+                        .mtu(mtu)
+                        .ipv4(addr, prefix, None);
+                    if let Some(n) = &name_for_closure {
+                        builder = builder.name(n);
+                    }
+                    builder.build_async()
+                }
             })
             .await
             {
@@ -484,6 +508,8 @@ impl TunListener {
                         let guard =
                             setup_global_auto_route(if_index, configured_iface, &listener_name)?;
                         Ok::<_, io::Error>(TunDevice {
+                            #[cfg(target_os = "windows")]
+                            dns_guard: None,
                             auto_route_guard: Some(guard),
                             device,
                         })
@@ -515,6 +541,8 @@ impl TunListener {
                             let result = tokio::task::spawn_blocking(move || {
                                 let route_guard = RouteGuard::setup(if_index, &nets)?;
                                 Ok::<_, io::Error>(TunDevice {
+                                    #[cfg(target_os = "windows")]
+                                    dns_guard: None,
                                     auto_route_guard: Some(AutoRouteGuard {
                                         route_guard: Some(route_guard),
                                         iface_guard: None,
@@ -551,6 +579,8 @@ impl TunListener {
                                 self.name
                             );
                             TunDevice {
+                                #[cfg(target_os = "windows")]
+                                dns_guard: None,
                                 auto_route_guard: None,
                                 device,
                             }
@@ -560,37 +590,44 @@ impl TunListener {
             }
         } else {
             TunDevice {
+                #[cfg(target_os = "windows")]
+                dns_guard: None,
                 auto_route_guard: None,
                 device,
             }
         };
 
-        // Wrap the device and its auto-route guard in a single `Arc` so they
-        // share one reference-counted lifetime.
-        let device = Arc::new(device);
-
-        // Windows: bind the loopback DNS sockets *before* DnsGuard repoints
-        // the OS resolver at them. If port 53 is already taken (ICS, Docker,
-        // another resolver), this fails startup loudly instead of silently
-        // leaving the whole machine with DNS aimed at a dead address.
+        // Move all owned resources into the blocking setup task. If the
+        // caller times out or is aborted, the result drops the DNS session,
+        // routes, and adapter together when the blocking operation finishes.
         #[cfg(target_os = "windows")]
-        let local_dns_sockets = if cfg.dns_hijack
-            && cfg.auto_route
-            && self.tunnel.resolver().fake_ip_v4_gateway().is_some()
-        {
-            Some(local_dns::bind().await.map_err(|e| {
-                io::Error::other(format!("loopback DNS server startup failed: {e}"))
+        let windows_dns_addr = if cfg.dns_hijack && cfg.auto_route {
+            Some(self.tunnel.resolver().fake_ip_v4_gateway().ok_or_else(|| {
+                io::Error::other("Windows TUN DNS requires a configured fake-IP IPv4 gateway")
             })?)
         } else {
             None
         };
+        #[cfg(target_os = "windows")]
+        let device = if let Some(gateway) = windows_dns_addr {
+            tokio::task::spawn_blocking(move || {
+                let mut device = device;
+                device.dns_guard = Some(dns::DnsGuard::setup(&device.device, gateway)?);
+                Ok::<_, io::Error>(device)
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("owned TUN DNS setup panicked: {e}")))??
+        } else {
+            device
+        };
+
+        // The pumps retain the adapter and every platform-owned resource.
+        let device = Arc::new(device);
 
         // When dns-hijack is on and we're in fake-IP mode, point the OS
-        // resolver at the loopback DNS server.  The backup + set calls into
-        // PowerShell (Get-DnsClientServerAddress / Set-DnsClientServerAddress)
-        // which can take tens of seconds on Windows, so run them on a
-        // blocking thread. The outer TUN_STARTUP_TIMEOUT guards the overall
-        // startup.
+        // resolver at the fake-IP gateway on platforms with a legacy DNS
+        // backend. Windows has completed required device-owned setup above.
+        #[cfg(not(target_os = "windows"))]
         let _dns_guard = if cfg.dns_hijack && cfg.auto_route {
             let t_dns = Instant::now();
             let guard = match self.tunnel.resolver().fake_ip_v4_gateway() {
@@ -626,18 +663,6 @@ impl TunListener {
 
         let mut tasks = TaskGroup::new();
 
-        // Windows: start the local DNS server on the sockets bound earlier
-        // (before DnsGuard repointed system DNS at 127.0.0.1 / ::1). The
-        // server answers queries using the same DnsServer::handle_query
-        // pipeline as the TUN dns-hijack path, returning fake IPs.
-        #[cfg(target_os = "windows")]
-        if let Some(sockets) = local_dns_sockets {
-            let resolver = Arc::clone(self.tunnel.resolver());
-            tasks.spawn(async move {
-                local_dns::run(sockets, resolver).await;
-            });
-        }
-
         let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
         tasks.push(&pump_in);
         tasks.push(&pump_out);
@@ -671,6 +696,10 @@ impl TunListener {
         // Signal readiness: device, stack, and child tasks are all up.
         // An `Err` return from this function sends `TunReady::Failed`
         // (with the real error) from `run` instead.
+        #[cfg(target_os = "windows")]
+        if let Some(gateway) = windows_dns_addr {
+            info!("tun windows-dns: ready device='{dev_name}' if_index={if_index} dns={gateway} protection=dynamic-wfp-v4-v6-udp-tcp53");
+        }
         if let Some(notifier) = notifier.take() {
             notifier.ready();
             debug!("TUN listener '{}' readiness signalled", self.name);
@@ -688,9 +717,10 @@ impl TunListener {
             tokio::select! {
                 accepted = tcp_listener.next() => match accepted {
                     Some((stream, src, dst)) => {
+                        let is_dns = cfg!(target_os = "windows") && cfg.dns_hijack && dst.port() == 53;
                         // Same loop guard as the UDP path: a dial to the
                         // TUN's own subnet routes back into the device.
-                        if udp::is_looping_dst(dst.ip(), tun_net) {
+                        if !is_dns && udp::is_looping_dst(dst.ip(), tun_net) {
                             debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
                             drop(stream);
                             continue;
@@ -735,6 +765,18 @@ impl TunListener {
                                 None
                             };
                             let _permit = permit;
+                            #[cfg(target_os = "windows")]
+                            if is_dns {
+                                let mut conn = TunTcpConn {
+                                    prefix,
+                                    pos: 0,
+                                    inner: std::sync::Mutex::new(stream),
+                                };
+                                if let Err(e) = tcp_dns::serve(&mut conn, tunnel.resolver()).await {
+                                    debug!("tun TCP dns-hijack: {src} -> {dst}: {e}");
+                                }
+                                return;
+                            }
                             handle_tcp_flow(tunnel, stream, prefix, src, dst, &name).await;
                         });
                     }
@@ -756,8 +798,8 @@ impl TunListener {
 /// macOS only accepts `utunN` device names and picks one itself when none is
 /// given, so never invent a name there — pass the configured name through
 /// unchanged (suffix rotation would produce an invalid `utunN-1`). Elsewhere
-/// default to "meow-tun" and rotate a numeric suffix to sidestep stale
-/// adapters from unclean shutdowns (common with wintun).
+/// default to "meow-tun" and rotate a numeric suffix for creation retries.
+/// On Windows each name is acquired with a fresh, verified adapter GUID.
 fn device_name_for_attempt(configured: Option<&str>, attempt: u32) -> Option<String> {
     if cfg!(target_os = "macos") {
         configured.map(str::to_string)
