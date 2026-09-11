@@ -27,6 +27,32 @@ pub(super) struct DnsGuard {
 
 impl DnsGuard {
     pub(super) fn setup(device: &tun_rs::AsyncDevice, dns: IpAddr) -> io::Result<Self> {
+        #[cfg(not(test))]
+        {
+            Self::setup_inner(device, dns)
+        }
+        #[cfg(test)]
+        {
+            Self::setup_with_after_dns(device, dns, &mut || Ok(()))
+        }
+    }
+
+    /// Native fixtures can fail at the real partial-setup boundary. This
+    /// control is absent from production builds and has no environment switch.
+    #[cfg(test)]
+    pub(super) fn setup_with_after_dns(
+        device: &tun_rs::AsyncDevice,
+        dns: IpAddr,
+        after_dns: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        Self::setup_inner(device, dns, Some(after_dns))
+    }
+
+    fn setup_inner(
+        device: &tun_rs::AsyncDevice,
+        dns: IpAddr,
+        #[cfg(test)] after_dns: Option<&mut dyn FnMut() -> io::Result<()>>,
+    ) -> io::Result<Self> {
         if !dns.is_ipv4() || device.addresses()?.contains(&dns) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -43,6 +69,10 @@ impl DnsGuard {
         device
             .set_dns_servers(&[dns])
             .map_err(|e| io::Error::other(format!("set DNS on owned TUN adapter: {e}")))?;
+        #[cfg(test)]
+        if let Some(after_dns) = after_dns {
+            after_dns()?;
+        }
         device
             .clear_dns_servers(false)
             .map_err(|e| io::Error::other(format!("clear IPv6 DNS on owned TUN adapter: {e}")))?;
