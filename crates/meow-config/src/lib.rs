@@ -365,6 +365,16 @@ pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error
     build_config(raw, None).await
 }
 
+/// 메모리 설정을 읽되 파일 로더와 같은 provider·selector 캐시 루트를 사용한다.
+/// 자격이 든 YAML을 디스크에 쓸 필요가 없으며 경로 검증도 유지한다.
+pub async fn load_config_from_str_with_cache_dir(
+    content: &str,
+    cache_dir: &Path,
+) -> Result<Config, anyhow::Error> {
+    let raw: raw::RawConfig = parse_raw_yaml(content)?;
+    build_config(raw, Some(cache_dir)).await
+}
+
 /// Parse a Clash/mihomo YAML document into [`raw::RawConfig`], expanding YAML
 /// anchor merge keys (`<<: *anchor`) before deserialisation.
 ///
@@ -2539,6 +2549,71 @@ mod async_guard_tests {
         use std::future::Future;
         use std::pin::Pin;
         let _fut: Pin<Box<dyn Future<Output = _>>> = Box::pin(super::load_config_from_str(""));
+    }
+}
+
+#[cfg(test)]
+mod memory_config_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn memory_config_preserves_selector_choices_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "proxy-groups:\n  - name: choice\n    type: select\n    proxies: [DIRECT, REJECT]\nrules:\n  - MATCH,choice\n";
+        let first = load_config_from_str_with_cache_dir(yaml, dir.path())
+            .await
+            .unwrap();
+        first
+            .proxies
+            .get("choice")
+            .unwrap()
+            .selection()
+            .unwrap()
+            .set("REJECT")
+            .await
+            .unwrap();
+        drop(first);
+        let second = load_config_from_str_with_cache_dir(yaml, dir.path())
+            .await
+            .unwrap();
+        let group = second
+            .proxies
+            .get("choice")
+            .unwrap()
+            .as_any()
+            .unwrap()
+            .downcast_ref::<meow_proxy::SelectorGroup>()
+            .unwrap();
+        assert_eq!(group.selected_proxy().unwrap().name(), "REJECT");
+        assert!(!dir.path().join("config.yaml").exists());
+    }
+
+    #[tokio::test]
+    async fn memory_config_keeps_file_provider_root_without_writing_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("domains.yaml"),
+            "payload:\n  - example.test\n",
+        )
+        .unwrap();
+        let yaml = "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    format: yaml\n    path: domains.yaml\nrules:\n  - RULE-SET,local,DIRECT\n  - MATCH,DIRECT\n";
+        let cfg = load_config_from_str_with_cache_dir(yaml, dir.path())
+            .await
+            .unwrap();
+        assert!(cfg.rule_providers.contains_key("local"));
+        assert_eq!(cfg.rules.len(), 2);
+        assert!(!dir.path().join("config.yaml").exists());
+    }
+
+    #[tokio::test]
+    async fn memory_config_rejects_provider_escape_like_the_file_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "rule-providers:\n  bad:\n    type: file\n    behavior: domain\n    path: ../outside.yaml\nrules:\n  - RULE-SET,bad,DIRECT\n";
+        let error = load_config_from_str_with_cache_dir(yaml, dir.path())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("escapes"), "{error}");
     }
 }
 
