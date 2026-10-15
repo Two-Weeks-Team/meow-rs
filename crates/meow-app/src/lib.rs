@@ -203,6 +203,8 @@ pub async fn run(
 
     // Create the tunnel (core routing engine)
     let tunnel = Tunnel::new(Arc::clone(&config.dns.resolver));
+    // One UDP idle policy for the shared NAT sweeper, SOCKS UDP and TUN flows.
+    tunnel.set_udp_idle(config.tun.udp_timeout);
     tunnel.set_mode(config.general.mode);
     tunnel.update_rules(config.rules);
     tunnel.update_proxies(config.proxies);

@@ -130,7 +130,7 @@ pub async fn handle_udp_associate(
                 }
             }
             _ = sweeper.tick() => {
-                let idle_ms = meow_tunnel::udp::DEFAULT_UDP_IDLE.as_millis() as u64;
+                let idle_ms = u64::try_from(tunnel.inner().udp_idle().as_millis()).unwrap_or(u64::MAX);
                 nat.retain(|_, session| {
                     let now = monotonic_ms() as meow_common::atomic::Uint;
                     let last = session.last_activity_ms.load(Ordering::Relaxed);

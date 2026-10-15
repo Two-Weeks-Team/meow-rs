@@ -8,7 +8,7 @@ use meow_proxy::DirectAdapter;
 use parking_lot::RwLock;
 use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -71,9 +71,19 @@ pub struct TunnelInner {
     /// Handle to the running TUN listener (if any). Abort + await it to
     /// stop TUN. Stored so `put_configs` can start/stop TUN at runtime.
     pub tun_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    /// UDP NAT idle timeout in milliseconds, from the typed config
+    /// (`tun.udp-timeout`, default [`udp::DEFAULT_UDP_IDLE`]). Every UDP
+    /// reader and sweeper of this tunnel reads it, so one policy applies to
+    /// the shared NAT table and to platform reply readers alike.
+    udp_idle_ms: AtomicU64,
 }
 
 impl TunnelInner {
+    /// UDP NAT idle timeout of this tunnel.
+    pub fn udp_idle(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.udp_idle_ms.load(Ordering::Relaxed))
+    }
+
     /// Snapshot the current route table: one short read lock + `Arc` clone.
     /// The returned `Arc` is safe to hold across `.await` points.
     pub fn route(&self) -> Arc<RouteTable> {
@@ -313,8 +323,19 @@ impl Tunnel {
                 needs_ip_resolution: AtomicBool::new(false),
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
+                udp_idle_ms: AtomicU64::new(udp::DEFAULT_UDP_IDLE.as_millis() as u64),
             }),
         }
+    }
+
+    /// Set the UDP NAT idle timeout before spawning sweepers or readers.
+    /// A zero duration keeps the current value: zero is not "never expire".
+    pub fn set_udp_idle(&self, idle: std::time::Duration) {
+        if idle.is_zero() {
+            return;
+        }
+        let millis = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+        self.inner.udp_idle_ms.store(millis, Ordering::Relaxed);
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {
@@ -410,7 +431,7 @@ impl Tunnel {
     pub fn spawn_background_tasks(&self) {
         udp::spawn_nat_sweeper(
             &self.inner.nat_table,
-            udp::DEFAULT_UDP_IDLE,
+            self.inner.udp_idle(),
             udp::DEFAULT_SWEEP_INTERVAL,
         );
         let stats = Arc::clone(&self.inner.stats);
