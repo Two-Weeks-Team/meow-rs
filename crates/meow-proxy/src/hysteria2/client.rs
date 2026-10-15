@@ -1,5 +1,6 @@
 use super::config::Config;
 use super::socket::{bind_protected_std_udp, Hy2UdpSocket};
+use super::supersession;
 use super::tcp::{self, DuplexStream};
 use super::tls;
 use super::udp::{self, UdpRouter, UdpSession};
@@ -62,6 +63,15 @@ impl ReconnectableClient {
             if conn.is_active() {
                 return Ok(Arc::clone(conn));
             }
+            // 감시 작업보다 먼저 닫힌 연결을 만나도 사유를 놓치지 않는다.
+            if let Some(reason) = conn.connection.close_reason() {
+                supersession::note_close(&reason);
+            }
+        }
+        // 같은 기기의 새 연결이 이어받았다. 다시 접속하면 그 연결을 도로 밀어내므로
+        // 엔진이 멈출 때까지 새 연결을 만들지 않는다.
+        if supersession::superseded() {
+            return Err(Error::Superseded);
         }
 
         let conn = Arc::new(connect_new(Arc::clone(&self.cfg)).await?);
@@ -75,6 +85,7 @@ pub(crate) struct ClientConnection {
     _endpoint: Endpoint,
     h3_driver: tokio::task::JoinHandle<()>,
     udp_driver: Option<tokio::task::JoinHandle<()>>,
+    close_watch: tokio::task::JoinHandle<()>,
     pub(crate) udp_enabled: bool,
     pub(crate) udp_router: Arc<UdpRouter>,
     pub(crate) next_session_id: std::sync::atomic::AtomicU32,
@@ -111,6 +122,7 @@ impl Drop for ClientConnection {
             }
         }
         self.h3_driver.abort();
+        self.close_watch.abort();
         if let Some(driver) = &self.udp_driver {
             driver.abort();
         }
@@ -251,11 +263,17 @@ async fn connect_addr_inner(
         setup.drivers.push(driver.abort_handle());
     }
 
+    // 서버가 연결을 닫으면 그 사유를 곧바로 기록한다. 다음 요청을 기다리지 않는다.
+    let close_watch = supersession::spawn_watch(connection.clone());
+    #[cfg(any(target_os = "windows", test))]
+    setup.drivers.push(close_watch.abort_handle());
+
     let client = ClientConnection {
         connection,
         _endpoint: endpoint,
         h3_driver,
         udp_driver,
+        close_watch,
         udp_enabled,
         udp_router,
         next_session_id: std::sync::atomic::AtomicU32::new(0),
@@ -536,6 +554,67 @@ mod tests {
         )
     }
 
+    /// 표지는 프로세스 전역이라 인계·일반 종료·재접속 거부를 한 시험에서 차례로 본다.
+    #[tokio::test]
+    async fn only_superseded_close_marks_engine_and_blocks_redial() {
+        supersession::clear_superseded();
+
+        // 일반 종료(code 0)는 인계가 아니다.
+        let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
+        let watch = supersession::spawn_watch(client.clone());
+        peer.close(0u32.into(), b"");
+        timeout(Duration::from_secs(3), watch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!supersession::superseded());
+
+        // 같은 코드가 아니면 사유 문자열이 같아도 인계가 아니다.
+        let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
+        let watch = supersession::spawn_watch(client.clone());
+        peer.close(7u32.into(), b"superseded");
+        timeout(Duration::from_secs(3), watch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!supersession::superseded());
+
+        // 노드가 인계 코드로 닫으면 엔진 표지가 선다.
+        let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
+        let watch = supersession::spawn_watch(client.clone());
+        peer.close(
+            quinn::VarInt::from_u64(supersession::SUPERSEDED_ERROR_CODE).unwrap(),
+            b"superseded",
+        );
+        timeout(Duration::from_secs(3), watch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(supersession::superseded());
+
+        // 표지가 선 엔진은 다시 접속하지 않는다(원본이 복사본을 도로 밀어내지 않는다).
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reconnecting = ReconnectableClient::new(Config {
+            server_addr: blackhole.local_addr().unwrap().to_string(),
+            ..(*test_config()).clone()
+        });
+        let result = timeout(Duration::from_secs(1), reconnecting.connection())
+            .await
+            .expect("superseded engine must refuse without dialing");
+        assert!(matches!(result, Err(Error::Superseded)));
+        let mut packet = [0u8; 64];
+        assert!(
+            timeout(Duration::from_millis(200), blackhole.recv_from(&mut packet))
+                .await
+                .is_err(),
+            "superseded engine sent a new QUIC handshake"
+        );
+
+        // 엔진을 새로 시작하면 지운다.
+        supersession::clear_superseded();
+        assert!(!supersession::superseded());
+    }
+
     #[tokio::test]
     async fn interface_watch_rejects_late_success_after_same_interface_down_up() {
         let (changes, receiver) = watch::channel(Ok(1));
@@ -692,6 +771,7 @@ mod tests {
             connection,
             _endpoint: endpoint,
             h3_driver: tokio::spawn(pending()),
+            close_watch: tokio::spawn(async {}),
             udp_enabled: true,
             udp_router: router,
             next_session_id: std::sync::atomic::AtomicU32::new(0),

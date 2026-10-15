@@ -28,6 +28,10 @@ pub enum Error {
 
     #[error("closed")]
     Closed,
+
+    /// 서버가 같은 기기의 새 연결에 넘겨 이 연결을 닫았다(SUPERSEDED_ERROR_CODE).
+    #[error("superseded by another connection of the same device")]
+    Superseded,
 }
 
 impl Error {
