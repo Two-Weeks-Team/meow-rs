@@ -31,7 +31,7 @@ impl ReconnectableClient {
         Self {
             cfg: Arc::new(cfg),
             conn: Mutex::new(None),
-            generation: supersession::current_generation(),
+            generation: crate::supersession::current_generation(),
         }
     }
 
@@ -73,7 +73,7 @@ impl ReconnectableClient {
         }
         // 같은 기기의 새 연결이 이어받았다. 다시 접속하면 그 연결을 도로 밀어내므로
         // 엔진이 멈출 때까지 새 연결을 만들지 않는다.
-        if supersession::superseded_in(self.generation) {
+        if crate::supersession::superseded_in(self.generation) {
             return Err(Error::Superseded);
         }
 
@@ -564,8 +564,8 @@ mod tests {
     #[tokio::test]
     async fn only_current_generation_takeover_marks_engine_and_blocks_redial() {
         let superseded_code = quinn::VarInt::from_u64(supersession::SUPERSEDED_ERROR_CODE).unwrap();
-        supersession::clear_superseded();
-        let generation = supersession::current_generation();
+        crate::supersession::clear_session_superseded();
+        let generation = crate::supersession::current_generation();
 
         // 일반 종료(code 0)는 인계가 아니다.
         let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
@@ -575,7 +575,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!supersession::superseded());
+        assert!(!crate::supersession::session_superseded());
 
         // 같은 코드가 아니면 사유 문자열이 같아도 인계가 아니다.
         let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
@@ -585,21 +585,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!supersession::superseded());
+        assert!(!crate::supersession::session_superseded());
 
         // 이전 엔진의 연결: 감시는 떠 있는데 엔진이 다시 시작된 뒤에야 인계 코드가 온다.
         // 새 엔진을 멈추면 안 된다(Codex 반례: 이전 감시 → 재시작 → 이전 감시 해제).
         let (_old_endpoint, old_client, _old_server_endpoint, old_peer) = quic_pair().await;
         let old_watch = supersession::spawn_watch(old_client.clone(), generation);
-        supersession::clear_superseded();
-        let generation = supersession::current_generation();
+        crate::supersession::clear_session_superseded();
+        let generation = crate::supersession::current_generation();
         old_peer.close(superseded_code, b"superseded");
         timeout(Duration::from_secs(3), old_watch)
             .await
             .unwrap()
             .unwrap();
         assert!(
-            !supersession::superseded(),
+            !crate::supersession::session_superseded(),
             "a stale takeover poisoned the new engine"
         );
 
@@ -611,7 +611,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(supersession::superseded());
+        assert!(crate::supersession::session_superseded());
 
         // 표지가 선 엔진은 다시 접속하지 않는다(원본이 복사본을 도로 밀어내지 않는다).
         let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -633,9 +633,9 @@ mod tests {
 
         // 엔진을 새로 시작하면 지금 세대는 깨끗하고, 이전 세대의 클라이언트도 새 엔진을
         // 멈추지 않는다.
-        supersession::clear_superseded();
-        assert!(!supersession::superseded());
-        assert!(!supersession::superseded_in(generation));
+        crate::supersession::clear_session_superseded();
+        assert!(!crate::supersession::session_superseded());
+        assert!(!crate::supersession::superseded_in(generation));
     }
 
     #[tokio::test]

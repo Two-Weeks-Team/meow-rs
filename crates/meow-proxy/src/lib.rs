@@ -5,6 +5,8 @@
 //! LoadBalance, and Relay groups.
 
 pub mod direct;
+pub mod supersession;
+pub use supersession::{clear_session_superseded, session_superseded};
 pub mod group;
 pub mod health;
 pub mod http_adapter;
@@ -43,12 +45,9 @@ pub use anytls_adapter::AnytlsAdapter;
 mod hysteria2;
 #[cfg(feature = "hysteria2")]
 pub mod hysteria2_adapter;
-/// 안심 노드가 같은 기기의 새 연결에 넘겨 HY2 연결을 닫았는지(엔진 프로세스 전역 표지).
+/// 안심 노드가 같은 기기 인계로 HY2 연결을 닫을 때 싣는 QUIC application error code.
 #[cfg(feature = "hysteria2")]
-pub use hysteria2::{
-    clear_superseded as clear_hy2_superseded, superseded as hy2_superseded,
-    SUPERSEDED_ERROR_CODE as HY2_SUPERSEDED_ERROR_CODE,
-};
+pub use hysteria2::SUPERSEDED_ERROR_CODE as HY2_SUPERSEDED_ERROR_CODE;
 #[cfg(feature = "hysteria2")]
 pub use hysteria2_adapter::{Hy2Adapter, Hy2HopInterval, Hy2Obfs, Hy2Options};
 
