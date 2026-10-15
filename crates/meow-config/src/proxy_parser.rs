@@ -1610,6 +1610,8 @@ fn parse_mux_options(
         min_streams: mux_usize_field(name, mux_cfg, "min-streams", 4)?,
         max_streams,
         only_tcp: mux_bool_field(name, mux_cfg, "only-tcp", false)?,
+        // 안심 확장: 노드의 같은 기기 인계 사유를 받는 제어 스트림(meow_proxy::mux::control).
+        session_control: mux_bool_field(name, mux_cfg, "ansim-session-control", false)?,
     }))
 }
 
@@ -3198,5 +3200,31 @@ tls: true
             "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nobfs-opts:\n  mode: http\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "mux", feature = "vless"))]
+mod mux_option_tests {
+    use super::parse_mux_options;
+    use std::collections::HashMap;
+
+    fn options(smux: &str) -> meow_proxy::mux::MuxOptions {
+        let config: HashMap<String, serde_yaml::Value> =
+            serde_yaml::from_str(&format!("smux:\n{smux}")).unwrap();
+        parse_mux_options("p", &config).unwrap().unwrap()
+    }
+
+    /// 안심 세션 제어 스트림은 `ansim-session-control: true`로만 켜진다.
+    #[test]
+    fn ansim_session_control_is_opt_in() {
+        assert!(!options("  enabled: true\n  protocol: smux\n").session_control);
+        assert!(
+            options("  enabled: true\n  protocol: smux\n  ansim-session-control: true\n")
+                .session_control
+        );
+        let config: HashMap<String, serde_yaml::Value> =
+            serde_yaml::from_str("smux:\n  enabled: true\n  ansim-session-control: yes-please\n")
+                .unwrap();
+        assert!(parse_mux_options("p", &config).is_err());
     }
 }

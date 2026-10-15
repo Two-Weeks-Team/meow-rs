@@ -563,6 +563,7 @@ mod tests {
     /// 세대는 프로세스 전역이라 인계·일반 종료·재접속 거부·이전 세대를 한 시험에서 차례로 본다.
     #[tokio::test]
     async fn only_current_generation_takeover_marks_engine_and_blocks_redial() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
         let superseded_code = quinn::VarInt::from_u64(supersession::SUPERSEDED_ERROR_CODE).unwrap();
         crate::supersession::clear_session_superseded();
         let generation = crate::supersession::current_generation();

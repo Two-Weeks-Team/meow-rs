@@ -5,6 +5,7 @@
 //! on the session with the fewest streams, new sessions are dialed only when
 //! the configured connection/stream bounds are reached.
 
+use super::control::ControlTask;
 use super::h2mux;
 use super::muxcool;
 use super::packet::MuxPacketConn;
@@ -50,6 +51,9 @@ pub struct MuxOptions {
     /// Route UDP through the plain proxy path instead of mux streams
     /// (mihomo SingMuxOption.OnlyTcp).
     pub only_tcp: bool,
+    /// 안심 세션 제어 스트림(`mux::control`)을 sing-mux 세션마다 연다. YAML `smux` 블록의
+    /// `ansim-session-control: true`. 안심 노드의 strict carrier에만 켠다.
+    pub session_control: bool,
 }
 
 impl Default for MuxOptions {
@@ -62,6 +66,7 @@ impl Default for MuxOptions {
             min_streams: 4,
             max_streams: 4,
             only_tcp: false,
+            session_control: false,
         }
     }
 }
@@ -309,15 +314,39 @@ pub(crate) struct MuxSession {
     /// increment are one atomic step.
     pub(crate) streams: AtomicUsize,
     pub(crate) last_used_ms: AtomicU,
+    /// 이 세션의 제어 작업(`session_control`일 때만). 필드라서 `MuxSession`이 버려지면
+    /// `ControlTask::drop`이 작업을 끊는다. 작업은 `MuxSession`을 잡지 않는다.
+    pub(crate) control: Option<ControlTask>,
+}
+
+impl MuxSession {
+    /// 풀에서 빠진다. 다른 핸들(packet conn 등)이 아직 이 세션을 잡고 있어도 제어 작업은
+    /// 여기서 끝낸다 — 정리된 carrier에 늦게 온 사유를 이 엔진의 인계로 읽지 않는다.
+    fn retire(&self) {
+        if let Some(control) = &self.control {
+            control.retire();
+        }
+    }
 }
 
 /// Releases a [`MuxSession`] slot when dropped — the cancellation-safe
 /// counterpart of the reservation `offer()` made via CAS on `streams`.
-struct Reservation(Arc<MuxSession>);
+struct Reservation(Option<Arc<MuxSession>>);
+
+impl Reservation {
+    /// 예약한 슬롯이 성립한 스트림이 됐다. 슬롯은 스트림이 닫힐 때(`MuxStreamConn::drop`)
+    /// 돌려준다. 여기서는 세션 참조만 놓는다 — `mem::forget`으로 버리면 그 `Arc`가 새어
+    /// 풀에서 빠진 세션(과 물리 carrier)이 영영 닫히지 않는다.
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.0.streams.fetch_sub(1, Ordering::SeqCst);
+        if let Some(session) = self.0.take() {
+            session.streams.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -326,6 +355,8 @@ pub struct MuxClient {
     dial: DialFn,
     options: MuxOptions,
     sessions: Mutex<VecDeque<Arc<MuxSession>>>,
+    /// 이 풀을 만든 엔진 세대(`crate::supersession`). 인계 사유는 이 세대에만 올린다.
+    generation: u64,
 }
 
 impl MuxClient {
@@ -334,6 +365,7 @@ impl MuxClient {
             dial,
             options,
             sessions: Mutex::new(VecDeque::new()),
+            generation: crate::supersession::current_generation(),
         })
     }
 
@@ -439,14 +471,14 @@ impl MuxClient {
             // offer() reserved one slot on `streams` via CAS.  The
             // guard releases it if the open future is cancelled or the
             // session rejects the stream.
-            let reservation = Reservation(Arc::clone(&session));
+            let reservation = Reservation(Some(Arc::clone(&session)));
             match session.kind.open_stream(host, port, udp).await {
                 Ok(stream) => {
                     // The slot reserved by offer() is now an established
-                    // stream.  Forget the reservation so its Drop doesn't
-                    // decrement — MuxStreamConn::drop will do that when
-                    // the stream is eventually closed.
-                    std::mem::forget(reservation);
+                    // stream.  Keep the slot (no decrement here) —
+                    // MuxStreamConn::drop will do that when the stream is
+                    // eventually closed.
+                    reservation.keep();
                     // Idle eviction is measured from the last successful open
                     // (not the last activity): conservative — a long-lived
                     // stream keeps its session alive via the streams count,
@@ -474,18 +506,29 @@ impl MuxClient {
     /// increment are a single atomic step, so concurrent offers can never
     /// overshoot max-streams.
     async fn offer(self: &Arc<Self>) -> Result<Arc<MuxSession>> {
+        // 같은 기기의 새 연결이 이 엔진의 carrier를 이어받았다. 새 세션·스트림을 열면 그
+        // 연결을 도로 밀어내므로 엔진이 멈출 때까지 아무것도 열지 않는다(새 dial 금지).
+        // 안심 strict carrier(`session_control`)에만 적용한다 — 그 밖의 mux 풀 동작은 그대로다.
+        if self.options.session_control && crate::supersession::superseded_in(self.generation) {
+            return Err(MeowError::Proxy(
+                "mux: carrier superseded by the same device elsewhere".into(),
+            ));
+        }
         let mut sessions = self.sessions.lock().await;
         let now = now_ms();
         sessions.retain(|s| {
-            if s.kind.is_unusable() {
-                return false;
-            }
             // Truncated-domain comparison (never widen to u64 first): on
             // mips32 `Uint` is u32 and wraps every ~49.7 days, so a plain
             // subtraction must use `wrapping_sub`, matching
             // `UdpSession::idle_for`.
             let idle = now.wrapping_sub(s.last_used_ms.load(Ordering::SeqCst));
-            s.streams.load(Ordering::SeqCst) > 0 || idle < IDLE_TIMEOUT.as_millis() as Uint
+            let keep = !s.kind.is_unusable()
+                && (s.streams.load(Ordering::SeqCst) > 0
+                    || idle < IDLE_TIMEOUT.as_millis() as Uint);
+            if !keep {
+                s.retire();
+            }
+            keep
         });
         let options = &self.options;
         let best = sessions
@@ -552,6 +595,12 @@ impl MuxClient {
                     "mux: session setup timed out",
                 ))
             })??;
+        // 제어 스트림은 `streams` 슬롯에 넣지 않는다 — 유휴 정리·용량 판단을 바꾸면 안 된다.
+        let control = if self.options.session_control {
+            ControlTask::spawn(&kind, self.generation)
+        } else {
+            None
+        };
         let session = Arc::new(MuxSession {
             kind,
             // Start at 1: the caller's reservation.  The pool lock is
@@ -559,6 +608,7 @@ impl MuxClient {
             // the slot is reserved.
             streams: AtomicUsize::new(1),
             last_used_ms: AtomicU::new(now_ms()),
+            control,
         });
         sessions.push_back(Arc::clone(&session));
         Ok(session)
@@ -938,6 +988,365 @@ mod tests {
         assert!(
             error.to_string().contains("session setup timed out"),
             "unexpected error: {error}"
+        );
+    }
+
+    // ─── 안심 세션 제어 스트림 ────────────────────────────────────────────────
+
+    /// 안심 노드를 흉내 내는 smux 서버(sagernet v1 프레임). 제어 목적지로 열린 스트림을
+    /// 알아보고, 시험이 넘긴 바이트를 그 스트림에 쓴다. 물리 연결이 닫히면 `closed`를 세운다.
+    struct FakeCarrier {
+        control: tokio::sync::watch::Receiver<Option<u32>>,
+        syns: Arc<AtomicUsize>,
+        out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        closed: tokio::sync::watch::Receiver<bool>,
+    }
+
+    const SMUX_FIN: u8 = 1;
+    const SMUX_PSH: u8 = 2;
+
+    fn smux_frame(cmd: u8, sid: u32, data: &[u8]) -> Vec<u8> {
+        let mut frame = vec![1, cmd];
+        frame.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&sid.to_le_bytes());
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    impl FakeCarrier {
+        fn spawn(server_io: tokio::io::DuplexStream) -> Self {
+            let (mut reader, mut writer) = tokio::io::split(server_io);
+            let (control_tx, control) = tokio::sync::watch::channel(None);
+            let (closed_tx, closed) = tokio::sync::watch::channel(false);
+            let (out, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let syns = Arc::new(AtomicUsize::new(0));
+            let reader_syns = Arc::clone(&syns);
+            tokio::spawn(async move {
+                // sing-mux 요청 헤더(version 0, protocol): padding 없음 → 2바이트.
+                let mut request = [0u8; 2];
+                if reader.read_exact(&mut request).await.is_ok() {
+                    let mut header = [0u8; 8];
+                    while reader.read_exact(&mut header).await.is_ok() {
+                        let len = u16::from_le_bytes([header[2], header[3]]) as usize;
+                        let sid = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+                        let mut payload = vec![0u8; len];
+                        if reader.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        match header[1] {
+                            0 => {
+                                reader_syns.fetch_add(1, Ordering::SeqCst);
+                            }
+                            SMUX_PSH => {
+                                let host = super::super::control::SESSION_CONTROL_HOST.as_bytes();
+                                if payload.windows(host.len()).any(|w| w == host) {
+                                    let _ = control_tx.send(Some(sid));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let _ = closed_tx.send(true);
+            });
+            tokio::spawn(async move {
+                while let Some(bytes) = out_rx.recv().await {
+                    if writer.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Self {
+                control,
+                syns,
+                out,
+                closed,
+            }
+        }
+
+        async fn control_stream(&self) -> u32 {
+            let mut control = self.control.clone();
+            let sid = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                control.wait_for(Option::is_some),
+            )
+            .await
+            .expect("the client must open the session control stream")
+            .unwrap();
+            sid.expect("checked")
+        }
+
+        /// 제어 스트림에 노드가 쓰는 바이트(맨 앞은 sing-mux per-stream status).
+        fn send(&self, sid: u32, data: &[u8]) {
+            let _ = self.out.send(smux_frame(SMUX_PSH, sid, data));
+        }
+
+        fn fin(&self, sid: u32) {
+            let _ = self.out.send(smux_frame(SMUX_FIN, sid, &[]));
+        }
+
+        async fn wait_closed(&self) -> bool {
+            let mut closed = self.closed.clone();
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), closed.wait_for(|c| *c))
+                    .await;
+            result.is_ok()
+        }
+    }
+
+    type Carriers = Arc<std::sync::Mutex<Vec<Arc<FakeCarrier>>>>;
+
+    fn ansim_options() -> MuxOptions {
+        // ansim-config가 strict 계정에 넣는 값과 같다.
+        MuxOptions {
+            protocol: Protocol::Smux,
+            max_connections: 1,
+            min_streams: 0,
+            max_streams: 0,
+            session_control: true,
+            ..MuxOptions::default()
+        }
+    }
+
+    fn fake_node_client(options: MuxOptions) -> (Arc<MuxClient>, Arc<AtomicUsize>, Carriers) {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let carriers: Carriers = Arc::default();
+        let dial_count = Arc::clone(&dials);
+        let dial_carriers = Arc::clone(&carriers);
+        let dial: DialFn = Arc::new(move || {
+            let dials = Arc::clone(&dial_count);
+            let carriers = Arc::clone(&dial_carriers);
+            Box::pin(async move {
+                dials.fetch_add(1, Ordering::SeqCst);
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                carriers
+                    .lock()
+                    .unwrap()
+                    .push(Arc::new(FakeCarrier::spawn(server_io)));
+                Ok(Box::new(TestConn(client_io)) as Box<dyn ProxyConn>)
+            })
+        });
+        (MuxClient::new(dial, options), dials, carriers)
+    }
+
+    fn carrier(carriers: &Carriers, index: usize) -> Arc<FakeCarrier> {
+        Arc::clone(&carriers.lock().unwrap()[index])
+    }
+
+    /// 풀에 남은 첫 세션의 제어 작업이 끝날 때까지 기다린다(사유 처리 완료).
+    async fn wait_control_finished(client: &Arc<MuxClient>) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                {
+                    let sessions = client.sessions.lock().await;
+                    let control = sessions[0].control.as_ref().expect("session control on");
+                    if control.is_finished() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the control task must finish after the node closes its stream");
+    }
+
+    async fn wait_superseded() -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !crate::supersession::session_superseded() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// (a)+(e) 현재 세션의 제어 스트림에 `superseded\n`이 오면 엔진 표지가 서고, 그 뒤의
+    /// open은 dial 없이(기존 세션도 쓰지 않고) 실패한다. 제어 스트림은 슬롯에 들지 않는다.
+    #[tokio::test]
+    async fn superseded_reason_marks_engine_and_blocks_new_opens() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
+        crate::supersession::clear_session_superseded();
+        let (client, dials, carriers) = fake_node_client(ansim_options());
+
+        let user = client.open_stream("a.example", 80).await.unwrap();
+        let node = carrier(&carriers, 0);
+        let sid = node.control_stream().await;
+        assert_eq!(
+            client.sessions.lock().await[0]
+                .streams
+                .load(Ordering::SeqCst),
+            1,
+            "the control stream must not take a pool slot"
+        );
+
+        node.send(sid, b"\x00superseded\n");
+        assert!(
+            wait_superseded().await,
+            "superseded\\n must mark the engine"
+        );
+
+        let Err(error) = client.open_stream("b.example", 80).await else {
+            panic!("a superseded engine must not open new streams");
+        };
+        assert!(error.to_string().contains("superseded"), "{error}");
+        assert!(client.open_packet_stream("1.1.1.1", 53).await.is_err());
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "no redial after a takeover"
+        );
+        drop(user);
+        crate::supersession::clear_session_superseded();
+    }
+
+    /// (b) 다른 내용·오류 status(옛 노드)·EOF·개행 없는 사유는 표지를 세우지 않는다.
+    #[tokio::test]
+    async fn other_control_outcomes_do_not_mark_the_engine() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
+        crate::supersession::clear_session_superseded();
+        let cases: [(&str, &[u8], bool); 5] = [
+            ("unknown reason", b"\x00expired\n", false),
+            (
+                "superseded with trailing text",
+                b"\x00superseded now\n",
+                false,
+            ),
+            ("no newline before EOF", b"\x00superseded", true),
+            // 옛 노드(ansim.6): 목적지 라우팅 실패 → status 1 + varbin 메시지.
+            ("remote error status", b"\x01\x0esuperseded\nxxx", true),
+            ("bare EOF", b"", true),
+        ];
+        for (name, bytes, fin) in cases {
+            let (client, _dials, carriers) = fake_node_client(ansim_options());
+            let _user = client.open_stream("a.example", 80).await.unwrap();
+            let node = carrier(&carriers, 0);
+            let sid = node.control_stream().await;
+            if !bytes.is_empty() {
+                node.send(sid, bytes);
+            }
+            if fin {
+                node.fin(sid);
+            }
+            wait_control_finished(&client).await;
+            assert!(!crate::supersession::session_superseded(), "{name}");
+            assert!(client.open_stream("b.example", 80).await.is_ok(), "{name}");
+        }
+    }
+
+    /// (c) 엔진이 다시 시작된 뒤(세대 변경) 이전 세션에 온 사유는 무시한다.
+    #[tokio::test]
+    async fn reason_from_a_previous_engine_generation_is_ignored() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
+        crate::supersession::clear_session_superseded();
+        let old_generation = crate::supersession::current_generation();
+        let (client, _dials, carriers) = fake_node_client(ansim_options());
+        let _user = client.open_stream("a.example", 80).await.unwrap();
+        let node = carrier(&carriers, 0);
+        let sid = node.control_stream().await;
+
+        crate::supersession::clear_session_superseded();
+        node.send(sid, b"\x00superseded\n");
+        wait_control_finished(&client).await;
+        assert!(!crate::supersession::session_superseded());
+        assert!(!crate::supersession::superseded_in(old_generation));
+        let (fresh, _fresh_dials, _fresh_carriers) = fake_node_client(ansim_options());
+        assert!(fresh.open_stream("a.example", 80).await.is_ok());
+    }
+
+    /// (d) 유휴 축출된 세션: 제어 작업이 끊겨 물리 연결이 닫히고, 그 carrier에 늦게 온
+    /// 사유는 무시된다. 제어 스트림은 `Arc<smux::Session>`을 잡으므로 끊지 않으면 옛
+    /// carrier가 노드에 살아 남아 새 carrier가 그것을 revoke한다(자기 자신을 인계로 오인).
+    #[tokio::test]
+    async fn evicted_session_closes_its_carrier_and_ignores_a_late_reason() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
+        crate::supersession::clear_session_superseded();
+        let (client, dials, carriers) = fake_node_client(ansim_options());
+        let user = client.open_stream("a.example", 80).await.unwrap();
+        let old = carrier(&carriers, 0);
+        let old_sid = old.control_stream().await;
+        drop(user);
+        {
+            let sessions = client.sessions.lock().await;
+            let stale = now_ms().wrapping_sub(IDLE_TIMEOUT.as_millis() as Uint * 2);
+            sessions[0].last_used_ms.store(stale, Ordering::SeqCst);
+        }
+
+        // 다음 open이 옛 세션을 축출하고 새 carrier를 연다. 제어 스트림이 유휴 판단을 막지 않는다.
+        let _user = client.open_stream("b.example", 80).await.unwrap();
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+        carrier(&carriers, 1).control_stream().await;
+
+        // 노드가 새 carrier를 보고 옛 carrier를 revoke한다.
+        old.send(old_sid, b"\x00superseded\n");
+        assert!(
+            old.wait_closed().await,
+            "an evicted session must release its physical carrier"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !crate::supersession::session_superseded(),
+            "a reason on our own evicted carrier is not a takeover"
+        );
+    }
+
+    /// (d') 풀 자체가 버려지면(엔진 정지) 사유가 오기 전에 carrier가 닫힌다.
+    #[tokio::test]
+    async fn dropping_the_pool_closes_carriers_and_ignores_a_late_reason() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
+        crate::supersession::clear_session_superseded();
+        let (client, _dials, carriers) = fake_node_client(ansim_options());
+        drop(client.open_stream("a.example", 80).await.unwrap());
+        let node = carrier(&carriers, 0);
+        let sid = node.control_stream().await;
+        drop(client);
+        // 사유가 오기 전에 닫혀야 한다: 열린 제어 스트림이 `Arc<smux::Session>`을 잡고 있어도
+        // 세션이 버려지면 그 참조를 놓는다.
+        assert!(
+            node.wait_closed().await,
+            "a dropped pool must close its carriers"
+        );
+        node.send(sid, b"\x00superseded\n");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!crate::supersession::session_superseded());
+    }
+
+    /// (f) session_control이 꺼져 있으면 제어 스트림을 열지 않는다.
+    #[tokio::test]
+    async fn session_control_off_opens_no_control_stream() {
+        let (client, _dials, carriers) = fake_node_client(MuxOptions {
+            session_control: false,
+            ..ansim_options()
+        });
+        let mut user = client.open_stream("a.example", 80).await.unwrap();
+        user.write_all(b"ping").await.unwrap();
+        user.flush().await.unwrap();
+        let node = carrier(&carriers, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(node.syns.load(Ordering::SeqCst), 1, "only the user stream");
+        assert!(node.control.borrow().is_none());
+        assert!(client.sessions.lock().await[0].control.is_none());
+    }
+
+    /// 성립한 스트림의 슬롯 예약이 세션 `Arc`를 새게 하지 않는다: 유휴 축출된 세션은
+    /// 제어 스트림이 없어도 물리 carrier를 닫는다(`mem::forget(Reservation)` 회귀).
+    #[tokio::test]
+    async fn evicted_idle_session_releases_its_carrier() {
+        let (client, dials, carriers) = fake_node_client(MuxOptions {
+            session_control: false,
+            ..ansim_options()
+        });
+        drop(client.open_stream("a.example", 80).await.unwrap());
+        {
+            let sessions = client.sessions.lock().await;
+            let stale = now_ms().wrapping_sub(IDLE_TIMEOUT.as_millis() as Uint * 2);
+            sessions[0].last_used_ms.store(stale, Ordering::SeqCst);
+        }
+        let _user = client.open_stream("b.example", 80).await.unwrap();
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+        assert!(
+            carrier(&carriers, 0).wait_closed().await,
+            "an evicted idle session must close its physical carrier"
         );
     }
 }

@@ -1305,6 +1305,7 @@ pub(crate) async fn new_packet_conn(
         kind: super::client::SessionKind::MuxCool(Arc::clone(&session)),
         streams: AtomicUsize::new(1),
         last_used_ms: meow_common::atomic::AtomicU::new(0),
+        control: None,
     });
     Ok(PacketConn::new(parts, pool_session, destination))
 }
@@ -2588,6 +2589,7 @@ mod tests {
             kind: SessionKind::MuxCool(Arc::clone(&session)),
             streams: std::sync::atomic::AtomicUsize::new(1),
             last_used_ms: meow_common::atomic::AtomicU::new(0),
+            control: None,
         });
         let parts = session
             .open_stream_parts("a.example", 80, true)
@@ -2667,6 +2669,7 @@ mod tests {
             kind: super::super::client::SessionKind::MuxCool(Arc::clone(&session)),
             streams: AtomicUsize::new(1),
             last_used_ms: meow_common::atomic::AtomicU::new(0),
+            control: None,
         });
         let parts = session
             .open_stream_parts("127.0.0.1", 18082, true)

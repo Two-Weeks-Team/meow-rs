@@ -15,6 +15,7 @@
 
 pub mod address;
 pub mod client;
+pub(crate) mod control;
 pub mod h2mux;
 pub mod muxcool;
 pub mod packet;

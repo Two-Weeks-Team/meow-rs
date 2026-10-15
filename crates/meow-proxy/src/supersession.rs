@@ -52,3 +52,7 @@ pub(crate) fn mark_superseded(generation: u64, carrier: &str) -> bool {
     SUPERSEDED.store(generation, Ordering::SeqCst);
     true
 }
+
+/// 세대·표지는 프로세스 전역이다. 그것을 바꾸거나 읽는 시험(HY2·mux)은 이 잠금 안에서 돈다.
+#[cfg(all(test, any(feature = "hysteria2", feature = "mux")))]
+pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
