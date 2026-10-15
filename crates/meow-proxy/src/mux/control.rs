@@ -18,7 +18,9 @@ use super::client::SessionKind;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
 /// 노드와 맞춘 예약 목적지(고정값).
@@ -31,8 +33,11 @@ const SUPERSEDED: &[u8] = b"superseded";
 /// 한 세션의 제어 작업. 버려지면 작업을 끊는다.
 pub(crate) struct ControlTask {
     abort: AbortHandle,
-    /// 세션이 풀에서 빠졌다. 끊기 직전에 이미 읽힌 사유도 무시하게 한다.
+    /// 세션이 풀에서 빠졌다. 끊기 직전에 이미 읽힌 사유도 무시하게 한다. 표지와 같은 잠금
+    /// 안에서만 세운다(`retire`) — 사유 처리(`mark_superseded_if`)와 어느 한쪽이 먼저 끝난다.
     retired: Arc<AtomicBool>,
+    /// 작업이 사유 처리까지 끝났다(사유·EOF·오류·abort 무엇이든).
+    settled: watch::Receiver<bool>,
 }
 
 impl ControlTask {
@@ -44,7 +49,10 @@ impl ControlTask {
         let kind = kind.clone();
         let retired = Arc::new(AtomicBool::new(false));
         let task_retired = Arc::clone(&retired);
+        let (settled_tx, settled) = watch::channel(false);
         let handle = tokio::spawn(async move {
+            // 어느 경로로 끝나든(반환·abort) 끝났다고 알린다.
+            let _settled = SettledOnDrop(settled_tx);
             let mut stream = match kind
                 .open_stream(SESSION_CONTROL_HOST, SESSION_CONTROL_PORT, false)
                 .await
@@ -57,15 +65,14 @@ impl ControlTask {
             };
             // 스트림이 필요한 만큼만 세션을 잡게 한다(이 복제본을 들고 기다리지 않는다).
             drop(kind);
+            #[cfg(test)]
+            test_gate::wait().await;
             match read_reason(&mut stream).await {
                 Ok(line) if line == SUPERSEDED => {
-                    if task_retired.load(Ordering::SeqCst) {
-                        tracing::debug!(
-                            "mux session control: ignoring a reason on a retired session"
-                        );
-                    } else {
-                        crate::supersession::mark_superseded(generation, "vless");
-                    }
+                    // 세대 비교와 "아직 풀에 묶인 carrier인가"를 표지 잠금 하나 안에서 본다.
+                    crate::supersession::mark_superseded_if(generation, "vless", || {
+                        !task_retired.load(Ordering::SeqCst)
+                    });
                 }
                 Ok(line) => tracing::debug!(
                     "mux session control: ignoring unknown reason {:?}",
@@ -77,14 +84,59 @@ impl ControlTask {
         Some(Self {
             abort: handle.abort_handle(),
             retired,
+            settled,
         })
     }
 
     /// 세션이 풀에서 빠졌다. 이후 도착하는 사유를 무시하고 제어 스트림(과 그 스트림이 잡은
     /// 물리 연결 참조)을 놓는다.
     pub(crate) fn retire(&self) {
-        self.retired.store(true, Ordering::SeqCst);
+        // 표지 잠금 안에서 표시한다. 이 뒤에 끝나는 사유 처리는 무시된다.
+        crate::supersession::with_state_lock(|| self.retired.store(true, Ordering::SeqCst));
         self.abort.abort();
+    }
+
+    /// 물리 연결이 끊긴 세션을 정리하기 전에, 이미 도착한 사유를 읽을 시간을 준다.
+    /// 노드는 사유를 쓴 뒤 부모를 닫으므로 세션이 죽은 것으로 보일 때 사유는 이미 스트림
+    /// 버퍼에 있다. 일반 EOF·옛 노드는 곧바로 끝난다. `limit`을 넘기면 포기한다.
+    pub(crate) async fn settle(&self, limit: Duration) {
+        let mut settled = self.settled.clone();
+        let _ = tokio::time::timeout(limit, settled.wait_for(|done| *done)).await;
+    }
+}
+
+/// 시험용: 제어 작업이 사유를 읽기 직전에 멈춘다(작업 순서를 강제한다).
+#[cfg(test)]
+pub(crate) mod test_gate {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Semaphore;
+
+    static GATE: Mutex<Option<Arc<Semaphore>>> = Mutex::new(None);
+
+    /// 닫힌 문을 건다. 돌려준 세마포어에 허가를 더하면 연다.
+    pub(crate) fn arm() -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        *GATE.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub(crate) fn disarm() {
+        *GATE.lock().unwrap() = None;
+    }
+
+    pub(super) async fn wait() {
+        let gate = GATE.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            let _ = gate.acquire().await;
+        }
+    }
+}
+
+struct SettledOnDrop(watch::Sender<bool>);
+
+impl Drop for SettledOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
     }
 }
 

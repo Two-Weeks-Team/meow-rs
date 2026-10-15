@@ -327,7 +327,18 @@ impl MuxSession {
             control.retire();
         }
     }
+
+    /// 물리 연결이 끊긴 세션: 이미 도착한 인계 사유를 읽을 시간을 준 뒤 뺀다.
+    async fn settle_and_retire(&self) {
+        if let Some(control) = &self.control {
+            control.settle(CONTROL_SETTLE).await;
+        }
+        self.retire();
+    }
 }
+
+/// 끊긴 세션의 제어 스트림이 이미 받은 사유를 처리할 시간 상한.
+const CONTROL_SETTLE: Duration = Duration::from_millis(300);
 
 /// Releases a [`MuxSession`] slot when dropped — the cancellation-safe
 /// counterpart of the reservation `offer()` made via CAS on `streams`.
@@ -516,20 +527,35 @@ impl MuxClient {
         }
         let mut sessions = self.sessions.lock().await;
         let now = now_ms();
+        let mut dead = Vec::new();
         sessions.retain(|s| {
+            if s.kind.is_unusable() {
+                // 끊긴 carrier는 사유를 읽힌 뒤 뺀다(아래). 노드가 사유를 쓰고 닫은 직후에
+                // 이 요청이 오면, 사유보다 먼저 새 carrier를 열어 도로 이어받으면 안 된다.
+                dead.push(Arc::clone(s));
+                return false;
+            }
             // Truncated-domain comparison (never widen to u64 first): on
             // mips32 `Uint` is u32 and wraps every ~49.7 days, so a plain
             // subtraction must use `wrapping_sub`, matching
             // `UdpSession::idle_for`.
             let idle = now.wrapping_sub(s.last_used_ms.load(Ordering::SeqCst));
-            let keep = !s.kind.is_unusable()
-                && (s.streams.load(Ordering::SeqCst) > 0
-                    || idle < IDLE_TIMEOUT.as_millis() as Uint);
+            let keep =
+                s.streams.load(Ordering::SeqCst) > 0 || idle < IDLE_TIMEOUT.as_millis() as Uint;
             if !keep {
                 s.retire();
             }
             keep
         });
+        for session in dead {
+            session.settle_and_retire().await;
+        }
+        // 잠금을 기다리는 사이나 위 정리 중에 인계 사유가 처리됐을 수 있다.
+        if self.options.session_control && crate::supersession::superseded_in(self.generation) {
+            return Err(MeowError::Proxy(
+                "mux: carrier superseded by the same device elsewhere".into(),
+            ));
+        }
         let options = &self.options;
         let best = sessions
             .iter()
@@ -1051,6 +1077,11 @@ mod tests {
             });
             tokio::spawn(async move {
                 while let Some(bytes) = out_rx.recv().await {
+                    // 빈 묶음은 "노드가 부모 carrier를 닫는다"는 뜻이다(앞서 보낸 프레임 뒤에).
+                    if bytes.is_empty() {
+                        let _ = writer.shutdown().await;
+                        return;
+                    }
                     if writer.write_all(&bytes).await.is_err() {
                         return;
                     }
@@ -1079,6 +1110,11 @@ mod tests {
         /// 제어 스트림에 노드가 쓰는 바이트(맨 앞은 sing-mux per-stream status).
         fn send(&self, sid: u32, data: &[u8]) {
             let _ = self.out.send(smux_frame(SMUX_PSH, sid, data));
+        }
+
+        /// 노드가 부모 carrier를 닫는다(앞서 보낸 사유 프레임 뒤에).
+        fn close_parent(&self) {
+            let _ = self.out.send(Vec::new());
         }
 
         fn fin(&self, sid: u32) {
@@ -1196,6 +1232,130 @@ mod tests {
             1,
             "no redial after a takeover"
         );
+        drop(user);
+        crate::supersession::clear_session_superseded();
+    }
+
+    /// 풀의 첫 세션이 끊긴 것으로 보일 때까지 기다린다(사유 처리는 기다리지 않는다).
+    async fn wait_unusable(client: &Arc<MuxClient>) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if client.sessions.lock().await[0].kind.is_unusable() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the parent close must make the session unusable");
+    }
+
+    /// Codex 반례(msg_866ca1875860): 노드가 사유를 쓰고 부모를 닫은 직후, 제어 작업이 그
+    /// 사유를 읽기 **전에** 다른 데이터 요청이 온다. 끊긴 세션을 정리하며 제어 작업을 끊고
+    /// 새 carrier를 열면 이미 도착한 인계를 버리고 도로 이어받는다. 정리 전에 사유를 읽을
+    /// 시간을 주므로 새 dial 없이 실패해야 한다. 표지를 기다린 뒤 요청하지 않는다.
+    #[tokio::test]
+    async fn a_queued_reason_is_not_dropped_by_a_concurrent_open() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
+        crate::supersession::clear_session_superseded();
+        let gate = super::super::control::test_gate::arm();
+        let (client, dials, carriers) = fake_node_client(ansim_options());
+        let user = client.open_stream("a.example", 80).await.unwrap();
+        let node = carrier(&carriers, 0);
+        let sid = node.control_stream().await;
+        node.send(sid, b"\x00superseded\n");
+        node.close_parent();
+        wait_unusable(&client).await;
+        assert!(
+            !crate::supersession::session_superseded(),
+            "gate must hold the reason"
+        );
+        let opener = Arc::clone(&client);
+        let open = tokio::spawn(async move { opener.open_stream("b.example", 80).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.add_permits(1);
+        let result = open.await.unwrap();
+        super::super::control::test_gate::disarm();
+        assert!(
+            result.is_err(),
+            "a delivered takeover must not be reclaimed"
+        );
+        assert!(crate::supersession::session_superseded());
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "no new carrier after a takeover"
+        );
+        drop(user);
+        crate::supersession::clear_session_superseded();
+    }
+
+    /// 사유 없는 일반 끊김(EOF)은 지금처럼 곧바로 새 carrier로 다시 연결한다.
+    #[tokio::test]
+    async fn a_plain_parent_close_still_reconnects() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
+        crate::supersession::clear_session_superseded();
+        let (client, dials, carriers) = fake_node_client(ansim_options());
+        let user = client.open_stream("a.example", 80).await.unwrap();
+        let node = carrier(&carriers, 0);
+        node.control_stream().await;
+        node.close_parent();
+        wait_unusable(&client).await;
+        let started = std::time::Instant::now();
+        let again = client.open_stream("b.example", 80).await;
+        assert!(again.is_ok(), "an ordinary close must reconnect");
+        assert!(
+            started.elapsed() < CONTROL_SETTLE,
+            "plain EOF must not wait for the settle bound"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+        assert!(!crate::supersession::session_superseded());
+        drop(user);
+        drop(again);
+    }
+
+    /// Codex 반례(msg_2596a2116835): 제어 작업이 "아직 풀에 묶여 있다"를 확인한 뒤 멈춘
+    /// 사이 세션이 풀에서 빠지면(retire), 늦은 표지가 그 뒤의 새 carrier를 끊는다. 빼기와
+    /// 표지 세우기를 한 잠금으로 묶었으므로 retire는 표지 기록이 끝날 때까지 기다리고, 그 뒤
+    /// 풀은 새 carrier를 열지 않는다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_cannot_slip_between_the_check_and_the_mark() {
+        let _serial = crate::supersession::TEST_LOCK.lock().await;
+        crate::supersession::clear_session_superseded();
+        let (client, dials, carriers) = fake_node_client(ansim_options());
+        let user = client.open_stream("a.example", 80).await.unwrap();
+        let session = Arc::clone(&client.sessions.lock().await[0]);
+        let node = carrier(&carriers, 0);
+        let sid = node.control_stream().await;
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        crate::supersession::test_hook::set(Some(Box::new(move |_| {
+            let _ = paused_tx.send(());
+            let _ = resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5));
+        })));
+        node.send(sid, b"\x00superseded\n");
+        tokio::task::spawn_blocking(move || {
+            paused_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let retiring = tokio::task::spawn_blocking(move || session.retire());
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !retiring.is_finished(),
+            "retire slipped between the bound check and the mark"
+        );
+        resume_tx.send(()).unwrap();
+        retiring.await.unwrap();
+        assert!(crate::supersession::session_superseded());
+        assert!(client.open_stream("b.example", 80).await.is_err());
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
         drop(user);
         crate::supersession::clear_session_superseded();
     }
