@@ -22,6 +22,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ReconnectableClient {
     cfg: Arc<Config>,
     conn: Mutex<Option<Arc<ClientConnection>>>,
+    /// 이 클라이언트를 만든 엔진 세대. 인계 사유는 이 세대가 현재일 때만 엔진에 올린다.
+    generation: u64,
 }
 
 impl ReconnectableClient {
@@ -29,6 +31,7 @@ impl ReconnectableClient {
         Self {
             cfg: Arc::new(cfg),
             conn: Mutex::new(None),
+            generation: supersession::current_generation(),
         }
     }
 
@@ -65,16 +68,22 @@ impl ReconnectableClient {
             }
             // 감시 작업보다 먼저 닫힌 연결을 만나도 사유를 놓치지 않는다.
             if let Some(reason) = conn.connection.close_reason() {
-                supersession::note_close(&reason);
+                supersession::note_close(&reason, self.generation);
             }
         }
         // 같은 기기의 새 연결이 이어받았다. 다시 접속하면 그 연결을 도로 밀어내므로
         // 엔진이 멈출 때까지 새 연결을 만들지 않는다.
-        if supersession::superseded() {
+        if supersession::superseded_in(self.generation) {
             return Err(Error::Superseded);
         }
 
-        let conn = Arc::new(connect_new(Arc::clone(&self.cfg)).await?);
+        let mut conn = connect_new(Arc::clone(&self.cfg)).await?;
+        // 서버가 연결을 닫으면 그 사유를 곧바로 기록한다. 다음 요청을 기다리지 않는다.
+        conn.close_watch = Some(supersession::spawn_watch(
+            conn.connection.clone(),
+            self.generation,
+        ));
+        let conn = Arc::new(conn);
         *guard = Some(Arc::clone(&conn));
         Ok(conn)
     }
@@ -85,7 +94,7 @@ pub(crate) struct ClientConnection {
     _endpoint: Endpoint,
     h3_driver: tokio::task::JoinHandle<()>,
     udp_driver: Option<tokio::task::JoinHandle<()>>,
-    close_watch: tokio::task::JoinHandle<()>,
+    close_watch: Option<tokio::task::JoinHandle<()>>,
     pub(crate) udp_enabled: bool,
     pub(crate) udp_router: Arc<UdpRouter>,
     pub(crate) next_session_id: std::sync::atomic::AtomicU32,
@@ -122,7 +131,9 @@ impl Drop for ClientConnection {
             }
         }
         self.h3_driver.abort();
-        self.close_watch.abort();
+        if let Some(watch) = &self.close_watch {
+            watch.abort();
+        }
         if let Some(driver) = &self.udp_driver {
             driver.abort();
         }
@@ -263,17 +274,12 @@ async fn connect_addr_inner(
         setup.drivers.push(driver.abort_handle());
     }
 
-    // 서버가 연결을 닫으면 그 사유를 곧바로 기록한다. 다음 요청을 기다리지 않는다.
-    let close_watch = supersession::spawn_watch(connection.clone());
-    #[cfg(any(target_os = "windows", test))]
-    setup.drivers.push(close_watch.abort_handle());
-
     let client = ClientConnection {
         connection,
         _endpoint: endpoint,
         h3_driver,
         udp_driver,
-        close_watch,
+        close_watch: None,
         udp_enabled,
         udp_router,
         next_session_id: std::sync::atomic::AtomicU32::new(0),
@@ -554,14 +560,16 @@ mod tests {
         )
     }
 
-    /// 표지는 프로세스 전역이라 인계·일반 종료·재접속 거부를 한 시험에서 차례로 본다.
+    /// 세대는 프로세스 전역이라 인계·일반 종료·재접속 거부·이전 세대를 한 시험에서 차례로 본다.
     #[tokio::test]
-    async fn only_superseded_close_marks_engine_and_blocks_redial() {
+    async fn only_current_generation_takeover_marks_engine_and_blocks_redial() {
+        let superseded_code = quinn::VarInt::from_u64(supersession::SUPERSEDED_ERROR_CODE).unwrap();
         supersession::clear_superseded();
+        let generation = supersession::current_generation();
 
         // 일반 종료(code 0)는 인계가 아니다.
         let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
-        let watch = supersession::spawn_watch(client.clone());
+        let watch = supersession::spawn_watch(client.clone(), generation);
         peer.close(0u32.into(), b"");
         timeout(Duration::from_secs(3), watch)
             .await
@@ -571,7 +579,7 @@ mod tests {
 
         // 같은 코드가 아니면 사유 문자열이 같아도 인계가 아니다.
         let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
-        let watch = supersession::spawn_watch(client.clone());
+        let watch = supersession::spawn_watch(client.clone(), generation);
         peer.close(7u32.into(), b"superseded");
         timeout(Duration::from_secs(3), watch)
             .await
@@ -579,13 +587,26 @@ mod tests {
             .unwrap();
         assert!(!supersession::superseded());
 
-        // 노드가 인계 코드로 닫으면 엔진 표지가 선다.
-        let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
-        let watch = supersession::spawn_watch(client.clone());
-        peer.close(
-            quinn::VarInt::from_u64(supersession::SUPERSEDED_ERROR_CODE).unwrap(),
-            b"superseded",
+        // 이전 엔진의 연결: 감시는 떠 있는데 엔진이 다시 시작된 뒤에야 인계 코드가 온다.
+        // 새 엔진을 멈추면 안 된다(Codex 반례: 이전 감시 → 재시작 → 이전 감시 해제).
+        let (_old_endpoint, old_client, _old_server_endpoint, old_peer) = quic_pair().await;
+        let old_watch = supersession::spawn_watch(old_client.clone(), generation);
+        supersession::clear_superseded();
+        let generation = supersession::current_generation();
+        old_peer.close(superseded_code, b"superseded");
+        timeout(Duration::from_secs(3), old_watch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !supersession::superseded(),
+            "a stale takeover poisoned the new engine"
         );
+
+        // 현재 엔진의 연결이 인계 코드로 닫히면 표지가 선다.
+        let (_client_endpoint, client, _server_endpoint, peer) = quic_pair().await;
+        let watch = supersession::spawn_watch(client.clone(), generation);
+        peer.close(superseded_code, b"superseded");
         timeout(Duration::from_secs(3), watch)
             .await
             .unwrap()
@@ -610,9 +631,11 @@ mod tests {
             "superseded engine sent a new QUIC handshake"
         );
 
-        // 엔진을 새로 시작하면 지운다.
+        // 엔진을 새로 시작하면 지금 세대는 깨끗하고, 이전 세대의 클라이언트도 새 엔진을
+        // 멈추지 않는다.
         supersession::clear_superseded();
         assert!(!supersession::superseded());
+        assert!(!supersession::superseded_in(generation));
     }
 
     #[tokio::test]
@@ -771,7 +794,7 @@ mod tests {
             connection,
             _endpoint: endpoint,
             h3_driver: tokio::spawn(pending()),
-            close_watch: tokio::spawn(async {}),
+            close_watch: None,
             udp_enabled: true,
             udp_router: router,
             next_session_id: std::sync::atomic::AtomicU32::new(0),
