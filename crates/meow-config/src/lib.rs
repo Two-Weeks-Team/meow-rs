@@ -426,7 +426,7 @@ pub type RebuildResult = (HashMap<SmolStr, Arc<dyn Proxy>>, Vec<Box<dyn Rule>>);
 /// Does not resolve rule-provider cache paths; use
 /// [`rebuild_from_raw_with_cache_dir`] when a working directory is available.
 pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::Error> {
-    rebuild_from_raw_impl(raw, None, None, &HashMap::new(), None, None, None)
+    rebuild_from_raw_impl(raw, None, None, &HashMap::new(), None, None, None, None)
 }
 
 /// Rebuild proxies/rules and inject `resolver` into the built-in DIRECT
@@ -443,7 +443,16 @@ pub fn rebuild_from_raw_with_resolver(
     resolver: Option<Arc<Resolver>>,
     cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
+    rebuild_from_raw_impl(
+        raw,
+        cache_dir,
+        resolver,
+        &HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Runtime rebuild variant that keeps live proxy-provider slots and the
@@ -466,6 +475,7 @@ pub fn rebuild_from_raw_runtime(
         store.as_ref(),
         None,
         None,
+        None,
     )
 }
 
@@ -477,7 +487,16 @@ pub fn rebuild_from_raw_with_cache_dir(
     cache_dir: Option<&Path>,
     resolver: Option<Arc<Resolver>>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
+    rebuild_from_raw_impl(
+        raw,
+        cache_dir,
+        resolver,
+        &HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Apply per-outbound `dialer-proxy` wrappers in place (issue #210).
@@ -561,6 +580,33 @@ fn apply_dialer_proxies(
     }
 }
 
+/// 두 번째 빌드(리졸버를 붙인 빌드)에서 첫 빌드의 어댑터를 그대로 쓸지.
+///
+/// DNS 는 첫 빌드의 어댑터를 `#PROXY` 레지스트리로 잡는다. 두 번째 빌드가 같은 프록시를 새로
+/// 만들면 DNS 와 일반 트래픽이 같은 자격의 **서로 다른 연결 풀**을 쓴다 — 서버가 자격당
+/// 연결 하나만 허용하면(안심 세션 게이트) 둘이 서로를 밀어낸다. 리졸버가 필요한 DIRECT·REJECT
+/// 와 다른 프록시를 거치는(`dialer-proxy`) 항목만 다시 만든다.
+fn reusable_proxy(
+    raw_proxy: &HashMap<String, serde_yaml::Value>,
+    reuse: Option<&HashMap<SmolStr, Arc<dyn Proxy>>>,
+) -> Option<Arc<dyn Proxy>> {
+    let name = raw_proxy.get("name")?.as_str()?;
+    if raw_proxy.contains_key("dialer-proxy") {
+        return None;
+    }
+    let existing = reuse?.get(name)?;
+    match existing.adapter_type() {
+        meow_common::AdapterType::Direct
+        | meow_common::AdapterType::Reject
+        | meow_common::AdapterType::RejectDrop => None,
+        _ => Some(Arc::clone(existing)),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one private builder shared by every load path"
+)]
 fn rebuild_from_raw_impl(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
@@ -569,6 +615,7 @@ fn rebuild_from_raw_impl(
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
+    reuse: Option<&HashMap<SmolStr, Arc<dyn Proxy>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     // Built-in proxies
@@ -600,6 +647,16 @@ fn rebuild_from_raw_impl(
     );
 
     for raw_proxy in raw.proxies.as_deref().unwrap_or(&[]) {
+        if let Some(existing) = reusable_proxy(raw_proxy, reuse) {
+            // 레지스트리 키는 YAML `name:` 이다(아래와 같은 규칙). reusable_proxy 가 그 이름으로 찾았다.
+            let key: SmolStr = raw_proxy
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| existing.name())
+                .into();
+            proxies.insert(key, existing);
+            continue;
+        }
         match proxy_parser::parse_proxy(raw_proxy) {
             Ok(proxy) => {
                 // Prefer the YAML `name:` as the registry key. `proxy.name()`
@@ -851,6 +908,10 @@ async fn prefetch_rule_provider_payloads_async(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors rebuild_from_raw_impl for the blocking pool"
+)]
 async fn rebuild_from_raw_impl_async(
     raw: raw::RawConfig,
     cache_dir: Option<PathBuf>,
@@ -859,6 +920,7 @@ async fn rebuild_from_raw_impl_async(
     selector_store: Option<Arc<meow_proxy::SelectorStore>>,
     ctx: meow_rules::ParserContext,
     provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
+    reuse: Option<HashMap<SmolStr, Arc<dyn Proxy>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
     spawn_blocking_with_current_dispatcher(move || {
         rebuild_from_raw_impl(
@@ -869,6 +931,7 @@ async fn rebuild_from_raw_impl_async(
             selector_store.as_ref(),
             Some(&ctx),
             Some(&provider_payloads),
+            reuse.as_ref(),
         )
     })
     .await
@@ -1687,9 +1750,11 @@ async fn build_config(
     //   2. Build the DNS resolver, passing those proxies as the
     //      `#PROXY-NAME` registry. The resolver does not call back into
     //      proxies during construction, so this is safe.
-    //   3. Rebuild proxies with the real resolver attached. The two
-    //      passes only differ in DIRECT's resolver field; nothing else
-    //      depends on the placeholder built in step 1.
+    //   3. Rebuild proxies with the real resolver attached. DIRECT (and
+    //      REJECT, and anything chained through `dialer-proxy`) is built
+    //      again; every other adapter from step 1 is reused as the same Arc,
+    //      so DNS and ordinary traffic share one adapter and its connection
+    //      pool instead of two (`reusable_proxy`).
     // Open the persistent selector store (one JSON file in cache_dir).
     // Missing/unreadable files yield an empty store — no fatal errors.
     let cache_dir_buf = cache_dir.map(Path::to_path_buf);
@@ -1729,6 +1794,7 @@ async fn build_config(
         selector_store.clone(),
         ctx.clone(),
         Arc::clone(&provider_payloads),
+        None,
     )
     .await?;
 
@@ -1744,6 +1810,8 @@ async fn build_config(
     )
     .await?;
 
+    // 첫 빌드의 어댑터(DIRECT 제외)를 그대로 써서 DNS 와 일반 트래픽이 같은 연결 풀을 쓴다
+    // (`reusable_proxy`).
     let (proxies, rules) = rebuild_from_raw_impl_async(
         raw.clone(),
         cache_dir_buf.clone(),
@@ -1752,6 +1820,7 @@ async fn build_config(
         selector_store.clone(),
         ctx.clone(),
         Arc::clone(&provider_payloads),
+        Some(proxies),
     )
     .await?;
 
@@ -2773,5 +2842,75 @@ rule-providers:
             panic!("`..` traversal in rule-provider path must fail the rebuild");
         };
         assert!(err.to_string().contains("escapes"), "unexpected: {err}");
+    }
+}
+
+#[cfg(test)]
+mod shared_adapter_tests {
+    use super::*;
+
+    /// DNS 는 첫 빌드의 어댑터를 `#PROXY` 로 잡는다. 두 번째 빌드가 같은 Arc 를 쓰지 않으면
+    /// DNS 와 일반 트래픽이 같은 자격의 연결 풀을 두 개 가져, 자격당 연결 하나인 서버에서
+    /// 서로를 밀어낸다(Codex msg_04af60c1263c: iOS60 자기 인계).
+    #[test]
+    fn the_resolver_pass_reuses_every_adapter_except_direct_and_chained() {
+        let raw = parse_raw_yaml(
+            r#"
+proxies:
+  - name: v
+    type: vless
+    server: 192.0.2.1
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    smux: { enabled: true, protocol: smux, max-connections: 1 }
+  - name: h
+    type: hysteria2
+    server: 192.0.2.1
+    port: 8443
+    password: synthetic
+  - name: chained
+    type: vless
+    server: 192.0.2.2
+    port: 443
+    uuid: 22222222-2222-4222-8222-222222222222
+    dialer-proxy: v
+  - name: local
+    type: direct
+proxy-groups:
+  - name: auto
+    type: select
+    proxies: [h, v]
+"#,
+        )
+        .unwrap();
+        let (first, _) =
+            rebuild_from_raw_impl(&raw, None, None, &HashMap::new(), None, None, None, None)
+                .unwrap();
+        let (second, _) = rebuild_from_raw_impl(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            Some(&first),
+        )
+        .unwrap();
+        for name in ["v", "h"] {
+            assert!(
+                Arc::ptr_eq(&first[name], &second[name]),
+                "{name} was rebuilt: DNS and traffic would hold separate pools"
+            );
+        }
+        for name in ["DIRECT", "local", "chained"] {
+            assert!(
+                !Arc::ptr_eq(&first[name], &second[name]),
+                "{name} must be rebuilt with the resolver pass"
+            );
+        }
+        // 그룹은 다시 만들지만, 그 구성원은 같은 어댑터다.
+        let members = second["auto"].members().unwrap();
+        assert_eq!(members, vec!["h".to_string(), "v".to_string()]);
     }
 }
