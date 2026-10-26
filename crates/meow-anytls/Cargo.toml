@@ -27,7 +27,7 @@ path = "src/lib.rs"
 
 [dependencies]
 meow-common = { path = "../meow-common", version = "0.21.2" }
-tokio = { version = "1.48", features = [
+tokio = { version = "1.54.1", features = [
     "macros",
     "rt-multi-thread",
     "io-util",
@@ -45,10 +45,10 @@ tokio = { version = "1.48", features = [
 # process default at startup (meow-app/main.rs), and the adapter builds its TLS
 # config with an explicit ring provider, so this crate's own `builder()`-based
 # helpers (used only by the dropped fork bins) are not on meow's runtime path.
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 
 serde = { version = "1", features = ["derive"] }
 
@@ -64,7 +64,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 once_cell = "1.21"
 socket2 = "0.6"
-trust-dns-resolver = { version = "0.23", default-features = false, features = ["tokio-runtime"] }
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio"] }
 
 thiserror = "2.0"
 anyhow = "1.0"
@@ -78,3 +78,6 @@ chrono = "0.4"
 # `TcpStream::connect` / `UdpSocket::bind` and the dep is never pulled in.
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

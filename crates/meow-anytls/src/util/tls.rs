@@ -1,9 +1,9 @@
 //! TLS utilities for certificate generation and configuration
 
 use crate::util::{AnyTlsError, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ServerConfig;
 use rustls::{ClientConfig, RootCertStore};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::sync::Arc;
 use std::{fs::File, io::BufReader, path::Path};
 
@@ -74,7 +74,7 @@ pub fn create_server_config_from_files<P: AsRef<Path>>(
 ) -> Result<Arc<ServerConfig>> {
     let cert_file = File::open(&cert_path).map_err(AnyTlsError::Io)?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
+    let certs = CertificateDer::pem_reader_iter(&mut cert_reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| AnyTlsError::Tls(format!("failed to parse certificate: {e}")))?;
     if certs.is_empty() {
@@ -86,11 +86,13 @@ pub fn create_server_config_from_files<P: AsRef<Path>>(
 
     let key_file = File::open(&key_path).map_err(AnyTlsError::Io)?;
     let mut key_reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| AnyTlsError::Tls(format!("failed to parse private key: {e}")))?
-        .ok_or_else(|| {
+    let key = PrivateKeyDer::from_pem_reader(&mut key_reader).map_err(|e| {
+        if matches!(e, rustls_pki_types::pem::Error::NoItemsFound) {
             AnyTlsError::Tls(format!("no private key found in {:?}", key_path.as_ref()))
-        })?;
+        } else {
+            AnyTlsError::Tls(format!("failed to parse private key: {e}"))
+        }
+    })?;
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -218,6 +220,25 @@ mod tests {
             PrivateKeyDer::Sec1(data) => assert!(!data.secret_sec1_der().is_empty()),
             _ => panic!("Unexpected key type"),
         }
+    }
+
+    #[test]
+    fn pem_loader_rejects_missing_and_mismatched_private_keys() {
+        install_ring();
+        let directory = tempfile::tempdir().unwrap();
+        let cert_path = directory.path().join("certificate.pem");
+        let key_path = directory.path().join("private-key.pem");
+        let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&cert_path, pair.cert.pem()).unwrap();
+        std::fs::write(&key_path, pair.signing_key.serialize_pem()).unwrap();
+        assert!(create_server_config_from_files(&cert_path, &key_path).is_ok());
+
+        // 인증서 PEM을 키로 받거나 서로 다른 키를 조용히 허용하지 않는다.
+        std::fs::write(&key_path, pair.cert.pem()).unwrap();
+        assert!(create_server_config_from_files(&cert_path, &key_path).is_err());
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&key_path, other.signing_key.serialize_pem()).unwrap();
+        assert!(create_server_config_from_files(&cert_path, &key_path).is_err());
     }
 
     #[test]

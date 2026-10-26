@@ -1,6 +1,8 @@
 //! Simple async DNS cache to reduce repeated lookups for popular domains.
 
 use crate::util::{AnyTlsError, Result};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::{Resolver, TokioResolver, net::runtime::TokioRuntimeProvider};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
@@ -10,8 +12,6 @@ use std::time::{Duration, Instant};
 use tokio::net::lookup_host;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace};
-use trust_dns_resolver::TokioAsyncResolver;
-use trust_dns_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 
 /// TTL for cached DNS entries.
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -19,8 +19,7 @@ const DEFAULT_TTL: Duration = Duration::from_secs(60);
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
 
 static DNS_CACHE: Lazy<DnsCache> = Lazy::new(DnsCache::new);
-static DNS_RESOLVER: Lazy<RwLock<Option<Arc<TokioAsyncResolver>>>> =
-    Lazy::new(|| RwLock::new(None));
+static DNS_RESOLVER: Lazy<RwLock<Option<Arc<TokioResolver>>>> = Lazy::new(|| RwLock::new(None));
 
 struct CacheEntry {
     addresses: Vec<SocketAddr>,
@@ -173,13 +172,20 @@ pub async fn set_custom_dns_servers(servers: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let mut resolver_config = ResolverConfig::new();
-    for server in &parsed_servers {
-        resolver_config.add_name_server(NameServerConfig::new(*server, Protocol::Udp));
-        resolver_config.add_name_server(NameServerConfig::new(*server, Protocol::Tcp));
-    }
-
-    let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
+    let name_servers = parsed_servers
+        .iter()
+        .map(|server| {
+            let mut config = NameServerConfig::udp_and_tcp(server.ip());
+            for connection in &mut config.connections {
+                connection.port = server.port();
+            }
+            config
+        })
+        .collect();
+    let resolver_config = ResolverConfig::from_name_servers(name_servers);
+    let resolver = Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+        .build()
+        .map_err(|err| AnyTlsError::Config(format!("Invalid DNS resolver configuration: {err}")))?;
     *resolver_guard = Some(Arc::new(resolver));
     DNS_CACHE.clear().await;
 

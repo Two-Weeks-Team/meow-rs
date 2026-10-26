@@ -118,6 +118,9 @@ fn generate_lwip_bindings() {
         .clang_arg("-I./old-src/custom")
         .clang_arg("-Wno-everything")
         .layout_tests(false)
+        // lwIP의 C 내부 할당은 그대로 두고 Rust에서 쓰지 않는 표준 런타임
+        // 심볼 재선언만 제외한다. bindgen의 c_ulong과 Rust usize 충돌을 막는다.
+        .blocklist_function("^(malloc|realloc)$")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
     if arch == "aarch64" && matches!(os.as_str(), "ios" | "tvos") {
         // https://github.com/rust-lang/rust-bindgen/issues/1211

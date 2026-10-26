@@ -39,6 +39,10 @@ fn test_state(raw: RawConfig) -> Arc<AppState> {
         DomainTrie::new(),
         true,
     ));
+    test_state_with_resolver(raw, resolver)
+}
+
+fn test_state_with_resolver(raw: RawConfig, resolver: Arc<Resolver>) -> Arc<AppState> {
     let tunnel = Tunnel::new(resolver);
 
     // Build proxies/rules from raw and apply
@@ -2799,7 +2803,20 @@ async fn post_dns_query_returns_known_host() {
 /// POST /dns/query for an unknown name returns `answer: null`.
 #[tokio::test]
 async fn post_dns_query_unknown_name_returns_null_answer() {
-    let state = test_state_default();
+    // 외부 DNS·VPN의 .invalid 응답 정책에 의존하지 않고 NXDOMAIN을 주입한다.
+    let resolver = Resolver::new_with_bootstrap(
+        vec![meow_dns::NameServerUrl::parse("rcode://name_error").unwrap()],
+        vec![],
+        vec![],
+        DnsMode::Normal,
+        DomainTrie::new(),
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let state = test_state_with_resolver(test_raw_config(), Arc::new(resolver));
     let app = create_router(state);
     let resp = app
         .oneshot(

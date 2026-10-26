@@ -762,9 +762,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_client_times_out_on_unroutable() {
-        // 192.0.2.1/24 is TEST-NET-1, guaranteed not to respond.
-        let client = DnsClient::udp("192.0.2.1:53".parse().unwrap())
+    async fn udp_client_times_out_when_server_does_not_answer() {
+        // 문서용 외부 주소도 VPN·DNS 중계기가 응답할 수 있다. 바인딩만 하고
+        // 응답하지 않는 루프백 서버로 실제 수신 시간 제한을 검증한다.
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = DnsClient::udp(blackhole.local_addr().unwrap())
             .with_timeout(Duration::from_millis(200));
         let r = client.query("example.test", RecordType::A).await;
         assert!(matches!(r, Err(ClientError::Timeout(_))));

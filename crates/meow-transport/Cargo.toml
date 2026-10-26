@@ -105,7 +105,7 @@ x25519-dalek = { workspace = true, optional = true }
 # boring-tls feature
 boring             = { workspace = true, optional = true }
 tokio-boring       = { workspace = true, optional = true }
-boring-sys         = { version = "5.0.2", optional = true }
+boring-sys         = { version = "5.3.0", optional = true }
 # Mozilla CA bundle for boring's X509Store. The BoringSSL connector
 # starts with an *empty* trust store; sandboxed runtimes (iOS
 # NetworkExtension, sealed app extensions) don't pick up system roots
@@ -116,7 +116,7 @@ boring-sys         = { version = "5.0.2", optional = true }
 # Seeding the same Mozilla root list rustls uses gives the boring path
 # parity with rustls and makes verification work uniformly across
 # platforms. Adds ~150 KB of DER blobs to the .rlib.
-webpki-root-certs  = { version = "1", optional = true }
+webpki-root-certs  = { version = "1.0.11", optional = true }
 
 [dev-dependencies]
 tokio        = { workspace = true }
